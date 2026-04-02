@@ -371,9 +371,10 @@ def first_screen(pred_dir: str, output_dir: str, pred_date: str, top_n: int = 20
     pool = pool[(pred_dt - pd.to_datetime(pool["listed_date"], errors="coerce")).dt.days.fillna(9999) >= 60]
     print(f"✓ 排除上市不足60天后剩余: {len(pool)} (移除 {before - len(pool)} 只)")
 
-    pool = pool.sort_values("score", ascending=False).head(top_n).reset_index(drop=True)
+    score_col = "robust_score" if "robust_score" in pool.columns else "score"
+    pool = pool.sort_values(score_col, ascending=False).head(top_n).reset_index(drop=True)
     print(f"\n◆ 初筛完成，选出 {len(pool)} 只股票:")
-    display_cols = [c for c in ["code", "score", "rank_pct", "price", "avg_turnover"] if c in pool.columns]
+    display_cols = [c for c in ["code", score_col, "score", "rank_pct", "price", "avg_turnover"] if c in pool.columns]
     print(pool[display_cols].to_string(index=False))
 
     out_csv = out_path / "first_screen.csv"

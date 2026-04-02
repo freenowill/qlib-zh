@@ -9,6 +9,7 @@ __pycache__/
 _build
 build/
 dist/
+DATA/
 
 *.pkl
 *.hd5

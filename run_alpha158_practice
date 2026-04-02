@@ -100,16 +100,22 @@ _this_friday() {
 
 T="$(_this_friday)"
 
-# 训练集: [T-3年] ~ [T-1周-1天] = 上周四
-T_MINUS_3Y="$(_date_offset_years "$T" -3)"
-T_MINUS_1W1D="$(_date_offset "$T" -8)"   # 1周+1天=8天前
-# 验证集: [T-1周] ~ [T-1天] = 上周五 ~ 本周四
-T_MINUS_1W="$(_date_offset "$T" -7)"
-T_MINUS_1D="$(_date_offset "$T" -1)"
-# 预测集: T 本周五
-PRED_DATE="$T"
+# 最近 5 年滚动窗口：
+# - train : 最近 5 年历史数据，避开最近 2 周
+# - valid : 最近第 2 个 1 周窗口
+# - test  : 最近第 1 个 1 周窗口
+#
+# 约束：train / valid / test 严格不重叠，且整体数据仅来自最近 5 年+
+# 2 周缓冲区；预测日期取最近一个完整 test 窗口的结束日。
+TRAIN_START="$(_date_offset_years "$T" -5)"
+TRAIN_END="$(_date_offset "$T" -15)"    # test 前 2 周的前 1 天
+VALID_START="$(_date_offset "$T" -14)"  # 最近第 2 周窗口开始
+VALID_END="$(_date_offset "$T" -8)"      # 最近第 2 周窗口结束
+TEST_START="$(_date_offset "$T" -7)"     # 最近第 1 周窗口开始
+TEST_END="$(_date_offset "$T" -1)"       # 最近第 1 周窗口结束
+PRED_DATE="$TEST_END"
 
-export T T_MINUS_3Y T_MINUS_1W1D T_MINUS_1W T_MINUS_1D PRED_DATE
+export T TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END PRED_DATE
 export EXP_NAME OUT_DIR SCRIPT_DIR DOCKER_IMAGE WORKDIR_IN_CONTAINER QDATA_HOST_DIR OUT_DIR_IN_CONTAINER
 
 # 创建所有输出目录
@@ -124,9 +130,10 @@ echo "============================================================"
 echo "  run_alpha158_practice"
 echo "  experiment : $EXP_NAME"
 echo "  T (本周五) : $T"
-echo "  训练集     : $T_MINUS_3Y ~ $T_MINUS_1W1D"
-echo "  验证集     : $T_MINUS_1W ~ $T_MINUS_1D"
-echo "  预测集     : $PRED_DATE"
+echo "  训练集     : $TRAIN_START ~ $TRAIN_END"
+echo "  验证集     : $VALID_START ~ $VALID_END"
+echo "  测试集     : $TEST_START ~ $TEST_END"
+echo "  预测日期   : $PRED_DATE"
 echo "  stage      : $START_STAGE → $END_STAGE"
 echo "  output     : $OUT_DIR"
 echo "============================================================"
@@ -187,12 +194,13 @@ run_stage2() {
     python3 "$PRACTICE_SCRIPTS/gen_practice_yaml.py" \
         --template "$YAML_SRC" \
         --output   "$YAML_PRACTICE" \
-        --train-start  "$T_MINUS_3Y" \
-        --train-end    "$T_MINUS_1W1D" \
-        --valid-start  "$T_MINUS_1W" \
-        --valid-end    "$T_MINUS_1D" \
-        --test-start   "$PRED_DATE" \
-        --test-end     "$PRED_DATE"
+      --model-mode robust \
+      --train-start  "$TRAIN_START" \
+      --train-end    "$TRAIN_END" \
+      --valid-start  "$VALID_START" \
+      --valid-end    "$VALID_END" \
+      --test-start   "$TEST_START" \
+      --test-end     "$TEST_END"
 
     echo "[2/4] 启动 Docker 容器并运行 qrun"
     PIPELINE_START_TS="$(date +%s)"

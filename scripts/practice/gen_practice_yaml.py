@@ -11,7 +11,48 @@ from pathlib import Path
 import yaml
 
 
-def patch_yaml(template_path: str, output_path: str, dates: dict) -> None:
+def validate_date_order(dates: dict) -> None:
+    """Ensure train/valid/test windows are strictly ordered and non-overlapping."""
+    keys = ["train_start", "train_end", "valid_start", "valid_end", "test_start", "test_end"]
+    missing = [k for k in keys if k not in dates]
+    if missing:
+        raise ValueError(f"Missing required dates: {missing}")
+
+    for left, right in zip(keys, keys[1:]):
+        if dates[left] >= dates[right]:
+            raise ValueError(
+                f"Invalid date order: {left}={dates[left]} must be earlier than {right}={dates[right]}"
+            )
+
+
+def _apply_model_mode(doc: dict, model_mode: str) -> None:
+    """Adjust LightGBM hyperparameters for a given stage2 regime."""
+    if model_mode == "default":
+        return
+
+    model = doc.setdefault("task", {}).setdefault("model", {}).setdefault("kwargs", {})
+    if model_mode == "robust":
+        # Based on stage2 analysis: positive IC but low IR / high drawdown.
+        # Use stronger regularization and lower tree complexity to improve stability.
+        model.update(
+            {
+                "learning_rate": 0.05,
+                "num_leaves": 128,
+                "max_depth": 6,
+                "colsample_bytree": 0.8,
+                "subsample": 0.8,
+                "lambda_l1": 500.0,
+                "lambda_l2": 1000.0,
+                "min_data_in_leaf": 64,
+            }
+        )
+    else:
+        raise ValueError(f"Unknown model_mode: {model_mode}")
+
+
+def patch_yaml(template_path: str, output_path: str, dates: dict, model_mode: str = "default") -> None:
+    validate_date_order(dates)
+
     with open(template_path, "r", encoding="utf-8") as f:
         content = f.read()
 
@@ -26,6 +67,8 @@ def patch_yaml(template_path: str, output_path: str, dates: dict) -> None:
     dh["end_time"]       = dates["test_end"]
     dh["fit_start_time"] = dates["train_start"]
     dh["fit_end_time"]   = dates["train_end"]
+
+    _apply_model_mode(doc, model_mode)
 
     # ──────────────────────────────────────────
     # 2. 更新 dataset segments
@@ -76,6 +119,7 @@ def main():
     ap.add_argument("--valid-end",   required=True, dest="valid_end")
     ap.add_argument("--test-start",  required=True, dest="test_start")
     ap.add_argument("--test-end",    required=True, dest="test_end")
+    ap.add_argument("--model-mode", choices=["default", "robust"], default="default", dest="model_mode")
     args = ap.parse_args()
 
     patch_yaml(
@@ -89,6 +133,7 @@ def main():
             "test_start":  args.test_start,
             "test_end":    args.test_end,
         },
+        model_mode=args.model_mode,
     )
 
 

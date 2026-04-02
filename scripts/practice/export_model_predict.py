@@ -74,6 +74,17 @@ def _normalize_index_datetime(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _robust_scale(series: pd.Series) -> pd.Series:
+    """Robust z-score based on median and MAD, clipped to [-3, 3]."""
+    s = pd.to_numeric(series, errors="coerce")
+    med = s.median()
+    mad = (s - med).abs().median()
+    if pd.isna(mad) or mad == 0:
+        return pd.Series(0.0, index=s.index)
+    z = (s - med) / (1.4826 * mad)
+    return z.clip(-3, 3)
+
+
 def _compute_ic_metrics(pred_df: pd.DataFrame, label_df: pd.DataFrame) -> dict:
     if pred_df is None or label_df is None or pred_df.empty or label_df.empty:
         return {"IC_mean": float("nan"), "IC_std": float("nan"), "ICIR": float("nan"), "rank_IC_mean": float("nan")}
@@ -242,7 +253,8 @@ def export_predict(run_dir: str, output_dir: str, pred_date: str):
         pred_df.columns = pred_df.columns[:1].tolist()
         pred_df.columns = ["score"]
 
-    # 取 pred_date 截面（如果没有精确匹配则取最后一个日期）
+    # 取 pred_date 截面（如果没有精确匹配则取最后一个可用交易日）
+    selected_pred_date = pred_date
     if pred_df.index.nlevels == 2:
         dates_available = pred_df.index.get_level_values("datetime").unique()
         dates_str = dates_available.astype(str)
@@ -252,6 +264,7 @@ def export_predict(run_dir: str, output_dir: str, pred_date: str):
             # 取最近日期
             latest = dates_available.max()
             print(f"⚠ pred_date={pred_date} 在数据中不存在，使用最近日期: {latest}")
+            selected_pred_date = pd.Timestamp(latest).strftime("%Y-%m-%d")
             slice_df = pred_df.xs(latest, level="datetime")
     else:
         slice_df = pred_df
@@ -268,8 +281,20 @@ def export_predict(run_dir: str, output_dir: str, pred_date: str):
     n = len(slice_df)
     slice_df["rank"]       = range(1, n + 1)
     slice_df["rank_pct"]   = (slice_df["rank"] / n * 100).round(2).astype(str) + "%"
-    slice_df["pred_date"]  = pred_date
+    slice_df["pred_date"]  = selected_pred_date
     slice_df["expected_return"] = slice_df["score"]
+
+    # 稳健化分数：降低极端值对下游筛选的冲击
+    if "score" in slice_df.columns and len(slice_df) > 1:
+        robust_z = _robust_scale(slice_df["score"])
+        rank_score = 1.0 - (slice_df["rank"] - 1) / max(n - 1, 1)
+        slice_df["robust_score"] = (0.6 * robust_z + 0.4 * rank_score).round(6)
+        slice_df["score_z"] = robust_z.round(6)
+        slice_df["score_rank"] = rank_score.round(6)
+    else:
+        slice_df["robust_score"] = slice_df["score"]
+        slice_df["score_z"] = 0.0
+        slice_df["score_rank"] = 1.0
 
     # ── 2. 绩效指标 ─────────────────────────────
     portfolio_dir = artifacts / "portfolio_analysis"
@@ -299,6 +324,16 @@ def export_predict(run_dir: str, output_dir: str, pred_date: str):
         for col in ["ffr", "pa", "pos"]:
             if col in indicator_df.index:
                 metrics[col] = float(indicator_df.loc[col].iloc[0])
+
+    # 额外统计：用于判断信号是否过于集中
+    if len(slice_df) > 1:
+        top_k = min(10, len(slice_df))
+        bot_k = min(10, len(slice_df))
+        metrics["score_mean"] = float(pd.to_numeric(slice_df["score"], errors="coerce").mean())
+        metrics["score_std"] = float(pd.to_numeric(slice_df["score"], errors="coerce").std())
+        metrics["score_spread_top_bottom"] = float(
+            slice_df["score"].head(top_k).mean() - slice_df["score"].tail(bot_k).mean()
+        )
 
     # ── 3. 把绩效指标拼接到每行（供下游引用）────
     for k, v in metrics.items():
