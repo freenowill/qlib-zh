@@ -27,6 +27,14 @@ warnings.filterwarnings("ignore")
 _QLIB_INITED = False
 
 
+def _affordable_price_cap() -> float:
+    cash_total = float(os.environ.get("CASH_TOTAL", "20000"))
+    hold_num = int(os.environ.get("HOLD_NUM", "5"))
+    fee = float(os.environ.get("TX_FEE_RATE", "0.0001"))
+    per_stock_budget = cash_total / max(hold_num, 1)
+    return max(per_stock_budget / (100 * (1 + fee)), 0.0)
+
+
 def _qlib_root() -> Path:
     return Path(os.environ.get("QLIB_DATA_DIR", "/root/.qlib/qlib_data/cn_data"))
 
@@ -69,7 +77,7 @@ def _local_basic_info(codes: list[str]) -> pd.DataFrame:
     if out.empty:
         out = pd.DataFrame({"code": [_normalize_symbol(c) for c in codes]})
         out["listed_date"] = pd.NaT
-    out["sec_name"] = ""
+    out["sec_name"] = out["code"]
     out["symbol"] = out["code"].map(lambda s: f"SHSE.{s}" if s.startswith(("5", "6", "9")) else f"SZSE.{s}")
     return out[["code", "sec_name", "listed_date", "symbol"]].drop_duplicates(subset=["code"])
 
@@ -124,6 +132,17 @@ def _to_gm_symbol(code: str) -> str:
 
 def _normalize_symbol(value: str) -> str:
     return _to_6digit(value)
+
+
+def _resolve_scores_csv(pred_path: Path) -> Path:
+    scores_csv = pred_path / "scores.csv"
+    if scores_csv.exists():
+        return scores_csv
+
+    candidates = sorted(pred_path.glob("walk_forward/*/model_predict/scores.csv"))
+    if candidates:
+        return candidates[-1]
+    raise FileNotFoundError(f"scores.csv 不存在: {scores_csv}")
 
 
 def _to_bool_series(series: pd.Series) -> pd.Series:
@@ -309,12 +328,23 @@ def first_screen(pred_dir: str, output_dir: str, pred_date: str, top_n: int = 20
     pred_path = Path(pred_dir)
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+    affordability_cap = _affordable_price_cap()
+    if affordability_cap > 0:
+        if max_price <= 0:
+            max_price = affordability_cap
+        else:
+            max_price = min(max_price, affordability_cap)
+        print(f"✓ 按资金约束修正最高股价阈值: {max_price:.2f} 元/股")
 
-    scores_csv = pred_path / "scores.csv"
-    if not scores_csv.exists():
-        raise FileNotFoundError(f"scores.csv 不存在: {scores_csv}")
+    scores_csv = _resolve_scores_csv(pred_path)
     scores_df = pd.read_csv(scores_csv)
+    if "pred_date" in scores_df.columns and not scores_df["pred_date"].dropna().empty:
+        file_pred_date = str(scores_df["pred_date"].dropna().astype(str).iloc[0])
+        if file_pred_date != pred_date:
+            print(f"  ⚠ 输入 pred_date={pred_date} 与 scores.csv 中的 pred_date={file_pred_date} 不一致，已自动对齐为后者")
+            pred_date = file_pred_date
     scores_df["code"] = scores_df["instrument"].astype(str).map(_normalize_symbol)
+    scores_df["pred_date"] = pred_date
     print(f"✓ 模型得分加载完成，共 {len(scores_df)} 只股票")
 
     basic_df = _get_basic_info(gm, scores_df["code"].dropna().astype(str).tolist())
@@ -325,6 +355,12 @@ def first_screen(pred_dir: str, output_dir: str, pred_date: str, top_n: int = 20
     else:
         print("  ⚠ 沪深300成分获取失败，使用全部得分股票作为候选池")
         pool = scores_df.copy()
+
+    pool = pool.merge(
+        basic_df[["code", "sec_name", "symbol", "listed_date"]].rename(columns={"sec_name": "name"}),
+        on="code",
+        how="left",
+    )
 
     st_set = _get_st_list(gm, basic_df, pred_date)
     before = len(pool)
@@ -358,20 +394,28 @@ def first_screen(pred_dir: str, output_dir: str, pred_date: str, top_n: int = 20
         before = len(pool)
         turnover_map = _avg_turnover(gm, set(pool["code"].tolist()), pred_date)
         pool["avg_turnover"] = pool["code"].map(turnover_map)
-        q20 = pool["avg_turnover"].quantile(0.2)
-        pool = pool[pool["avg_turnover"] > q20]
-        print(f"✓ 排除成交额后20%后剩余: {len(pool)} (移除 {before - len(pool)} 只，阈值={q20:,.0f})")
+        valid_turnover = pd.to_numeric(pool["avg_turnover"], errors="coerce").dropna()
+        if not valid_turnover.empty and (valid_turnover > 0).any():
+            q20 = valid_turnover.quantile(0.2)
+            pool = pool[pd.to_numeric(pool["avg_turnover"], errors="coerce").fillna(0) > q20]
+            print(f"✓ 排除成交额后20%后剩余: {len(pool)} (移除 {before - len(pool)} 只，阈值={q20:,.0f})")
+        else:
+            print("  ⚠ 成交额数据不足，跳过后20%流动性过滤")
     else:
         pool["price"] = float("nan")
         pool["avg_turnover"] = float("nan")
 
     pred_dt = pd.to_datetime(pred_date)
     before = len(pool)
-    pool = pool.merge(basic_df[["code", "listed_date"]], on="code", how="left")
     pool = pool[(pred_dt - pd.to_datetime(pool["listed_date"], errors="coerce")).dt.days.fillna(9999) >= 60]
     print(f"✓ 排除上市不足60天后剩余: {len(pool)} (移除 {before - len(pool)} 只)")
 
-    score_col = "robust_score" if "robust_score" in pool.columns else "score"
+    if "score_final" in pool.columns:
+        score_col = "score_final"
+    elif "robust_score" in pool.columns:
+        score_col = "robust_score"
+    else:
+        score_col = "score"
     pool = pool.sort_values(score_col, ascending=False).head(top_n).reset_index(drop=True)
     print(f"\n◆ 初筛完成，选出 {len(pool)} 只股票:")
     display_cols = [c for c in ["code", score_col, "score", "rank_pct", "price", "avg_turnover"] if c in pool.columns]
@@ -388,7 +432,7 @@ def main():
     ap.add_argument("--output", required=True)
     ap.add_argument("--pred-date", required=True, dest="pred_date")
     ap.add_argument("--top-n", type=int, default=20, dest="top_n")
-    ap.add_argument("--max-price", type=float, default=50.0, dest="max_price")
+    ap.add_argument("--max-price", type=float, default=0.0, dest="max_price")
     args = ap.parse_args()
     first_screen(args.pred_dir, args.output, args.pred_date, top_n=args.top_n, max_price=args.max_price)
 

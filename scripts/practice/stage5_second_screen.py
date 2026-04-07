@@ -2,20 +2,160 @@
 """
 stage5_second_screen.py
 二筛：
-  1. 从 risk_eval 读取风险 / 估值标签
-  2. 过滤掉 高风险 或 高估值 的股票
-  3. 从 model_predict/scores.csv 补充 score / rank / rank_pct /
-     annualized_return / max_drawdown / sharpe_ratio / monthly_win_rate
-  4. 按 rank 升序（得分最高）取 hold_num 支
+    1. 从 risk_eval 读取财务 / 风险 / 估值标签
+    2. 过滤掉 财务差 / 高风险 / 高估值 的股票
+    3. 从 model_predict/scores.csv 补充 score / rank / percentile /
+         annualized_return / max_drawdown / sharpe_ratio / ICIR / monthly_win_rate
+    4. 以模型分数为主，叠加 IC、稳定性、近期表现构建综合分
+    5. 取 Top-K 进入目标组合
 输出: <output>/second_screen.csv
 """
 import argparse
+import os
 import warnings
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore")
+
+
+def _normalize_code(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.replace(r"^[A-Za-z]+", "", regex=True).str.zfill(6)
+
+
+def _risk_order(series: pd.Series) -> pd.Series:
+    mapping = {"低": 0, "中": 1, "高": 2}
+    return series.map(mapping).fillna(3)
+
+
+def _valuation_order(series: pd.Series) -> pd.Series:
+    mapping = {"低": 0, "中": 1, "高": 2}
+    return series.map(mapping).fillna(3)
+
+
+def _normalize_industry(series: pd.Series) -> pd.Series:
+    out = series.astype(str).str.strip()
+    return out.replace({"nan": "未知", "None": "未知", "": "未知"}).fillna("未知")
+
+
+def _minmax(series: pd.Series, ascending: bool = True) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    if s.notna().sum() <= 1:
+        return pd.Series(0.0, index=series.index)
+    lo, hi = s.min(), s.max()
+    if pd.isna(lo) or pd.isna(hi) or hi == lo:
+        return pd.Series(0.0, index=series.index)
+    scaled = (s - lo) / (hi - lo)
+    if not ascending:
+        scaled = 1 - scaled
+    return scaled.fillna(0.0)
+
+
+def _resolve_scores_csv(pred_dir: str) -> Path:
+    pred_path = Path(pred_dir)
+    scores_csv = pred_path / "scores.csv"
+    if scores_csv.exists():
+        return scores_csv
+    candidates = sorted(pred_path.glob("walk_forward/*/model_predict/scores.csv"))
+    if candidates:
+        return candidates[-1]
+    raise FileNotFoundError(f"scores.csv 不存在: {scores_csv}")
+
+
+_QLIB_INITED = False
+
+
+def _qlib_root() -> str:
+    return os.environ.get("QLIB_DATA_DIR", "/root/.qlib/qlib_data/cn_data")
+
+
+def _ensure_qlib():
+    global _QLIB_INITED
+    if _QLIB_INITED:
+        return
+    import qlib
+    from qlib.constant import REG_CN
+
+    qlib.init(provider_uri=_qlib_root(), region=REG_CN)
+    _QLIB_INITED = True
+
+
+def _to_qlib_code(code: str) -> str:
+    code = str(code).zfill(6)
+    prefix = "SH" if code.startswith(("5", "6", "9")) else "SZ"
+    return f"{prefix}{code}"
+
+
+def _history_volatility(codes: list[str], pred_date: str, lookback_days: int = 60) -> pd.DataFrame:
+    _ensure_qlib()
+    from qlib.data import D
+
+    if not codes:
+        return pd.DataFrame(columns=["code", "volatility_60d"])
+
+    end_ts = pd.Timestamp(pred_date)
+    start_ts = end_ts - pd.Timedelta(days=lookback_days * 3)
+    q_codes = [_to_qlib_code(code) for code in codes]
+    close_df = D.features(q_codes, ["$close"], start_time=start_ts.strftime("%Y-%m-%d"), end_time=pred_date)
+    if close_df is None or len(close_df) == 0:
+        return pd.DataFrame({"code": codes, "volatility_60d": np.nan})
+
+    close_df = close_df.reset_index()
+    close_df.columns = ["instrument", "datetime", "close"]
+    close_df["code"] = close_df["instrument"].astype(str).str.replace(r"^[A-Za-z]+", "", regex=True).str.zfill(6)
+    close_df["datetime"] = pd.to_datetime(close_df["datetime"], errors="coerce")
+    close_df["close"] = pd.to_numeric(close_df["close"], errors="coerce")
+    close_df = close_df.sort_values(["code", "datetime"])
+    close_df["ret"] = close_df.groupby("code")["close"].pct_change()
+    vol = close_df.groupby("code")["ret"].apply(lambda s: float(s.dropna().tail(lookback_days).std(ddof=1)) if s.dropna().shape[0] >= 5 else np.nan)
+    return vol.rename("volatility_60d").reset_index()
+
+
+def _apply_risk_parity_weights(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    vol = pd.to_numeric(out.get("volatility_60d"), errors="coerce")
+    inv_vol = 1.0 / vol.replace(0, np.nan)
+    inv_vol = inv_vol.replace([np.inf, -np.inf], np.nan)
+    if inv_vol.notna().sum() == 0:
+        out["risk_parity_weight"] = 1.0 / max(len(out), 1)
+    else:
+        inv_vol = inv_vol.fillna(inv_vol.dropna().median() if inv_vol.notna().any() else 1.0)
+        out["risk_parity_weight"] = inv_vol / inv_vol.sum()
+    out["weight"] = out["risk_parity_weight"]
+    return out
+
+
+def _apply_industry_cap(df: pd.DataFrame, hold_num: int, cap_ratio: float = 0.40) -> pd.DataFrame:
+    out = df.copy().reset_index(drop=True)
+    if out.empty:
+        return out
+
+    if "industry" not in out.columns:
+        out["industry"] = "未知"
+    out["industry"] = _normalize_industry(out["industry"])
+
+    max_per_industry = max(1, int(np.floor(hold_num * cap_ratio)))
+    selected_rows: list[int] = []
+    industry_counts: dict[str, int] = {}
+
+    for idx, row in out.iterrows():
+        industry = str(row["industry"])
+        if industry_counts.get(industry, 0) >= max_per_industry:
+            continue
+        selected_rows.append(idx)
+        industry_counts[industry] = industry_counts.get(industry, 0) + 1
+        if len(selected_rows) >= hold_num:
+            break
+
+    if len(selected_rows) < hold_num:
+        print(
+            f"  ⚠ 行业约束后可选股票仅 {len(selected_rows)} 只，低于目标 {hold_num} 只；"
+            f" 当前行业上限={max_per_industry}"
+        )
+
+    return out.loc[selected_rows].reset_index(drop=True)
 
 
 def second_screen(risk_eval_csv: str, pred_dir: str,
@@ -27,32 +167,35 @@ def second_screen(risk_eval_csv: str, pred_dir: str,
     risk_df = pd.read_csv(risk_eval_csv)
     if "code" not in risk_df.columns and "instrument" in risk_df.columns:
         risk_df["code"] = risk_df["instrument"]
+    if "code" in risk_df.columns:
+        risk_df["code"] = _normalize_code(risk_df["code"])
     print(f"✓ 加载 risk_eval: {len(risk_df)} 只股票")
 
-    # ── 2. 过滤 高风险 / 高估值 ───────────────────
+    # ── 2. 过滤 财务差 / 高风险 / 高估值 ───────────
     before = len(risk_df)
     mask_ok = (
-        (risk_df["risk_label"] != "高风险") &
-        (risk_df["valuation_label"] != "高估值")
+        (risk_df.get("financial_label", "中") != "差") &
+        (risk_df["risk_label"] != "高") &
+        (risk_df["valuation_label"] != "高")
     )
     filtered = risk_df[mask_ok].copy()
-    print(f"✓ 过滤高风险/高估值: {before} → {len(filtered)} 只")
+    print(f"✓ 过滤财务差/高风险/高估值: {before} → {len(filtered)} 只")
 
     if filtered.empty:
-        print("  ⚠ 过滤后无剩余股票！将保留中风险/正常估值股票（放宽条件）")
-        filtered = risk_df[risk_df["risk_label"] != "高风险"].copy()
+        print("  ⚠ 过滤后无剩余股票！将放宽为仅排除高风险")
+        filtered = risk_df[risk_df["risk_label"] != "高"].copy()
 
     # ── 3. 从 model_predict/scores.csv 补充得分信息 ─
-    scores_csv = Path(pred_dir) / "scores.csv"
-    if not scores_csv.exists():
-        raise FileNotFoundError(f"scores.csv 不存在: {scores_csv}")
+    scores_csv = _resolve_scores_csv(pred_dir)
     scores_df = pd.read_csv(scores_csv)
 
     # 统一 code 字段
     if "code" not in scores_df.columns and "instrument" in scores_df.columns:
-        scores_df["code"] = scores_df["instrument"].astype(str).str.replace(r'^[A-Za-z]+', '', regex=True).str.zfill(6)
+        scores_df["code"] = _normalize_code(scores_df["instrument"])
+    if "code" in scores_df.columns:
+        scores_df["code"] = _normalize_code(scores_df["code"])
 
-    merge_cols = ["code", "score", "rank", "rank_pct"]
+    merge_cols = ["code", "stock", "date", "score", "score_final", "rank", "percentile", "rank_pct"]
     perf_cols  = ["annualized_return", "max_drawdown", "sharpe_ratio", "ICIR", "monthly_win_rate"]
     for c in perf_cols:
         if c in scores_df.columns:
@@ -67,16 +210,63 @@ def second_screen(risk_eval_csv: str, pred_dir: str,
         on="code",
         how="left"
     )
+    pred_date = None
+    for col in ["date", "pred_date"]:
+        if col in result.columns and result[col].notna().any():
+            pred_date = str(result[col].dropna().astype(str).iloc[0])
+            break
 
-    # ── 4. 按 rank 升序取 top hold_num ───────────
+    # ── 4. 对候选池排序，并同时保存完整候选列表 ──────
+    result["_risk_order"] = _risk_order(result.get("risk_label", pd.Series(index=result.index, dtype=object)))
+    result["_valuation_order"] = _valuation_order(result.get("valuation_label", pd.Series(index=result.index, dtype=object)))
+    result["_financial_score"] = pd.to_numeric(result.get("financial_score"), errors="coerce")
+    primary_score = result.get("score_final", result.get("score"))
+    result["_score"] = pd.to_numeric(primary_score, errors="coerce")
+    result["_ann_norm"] = _minmax(result.get("annualized_return", pd.Series(index=result.index, dtype=float)))
+    result["_mdd_norm"] = _minmax(result.get("max_drawdown", pd.Series(index=result.index, dtype=float)), ascending=True)
+    result["_sharpe_norm"] = _minmax(result.get("sharpe_ratio", pd.Series(index=result.index, dtype=float)))
+    result["_icir_norm"] = _minmax(result.get("ICIR", pd.Series(index=result.index, dtype=float)))
+    result["_win_norm"] = _minmax(result.get("monthly_win_rate", pd.Series(index=result.index, dtype=float)))
+    result["_score_norm"] = _minmax(result["_score"])
+    result["composite_score"] = (
+        0.55 * result["_score_norm"]
+        + 0.15 * result["_icir_norm"]
+        + 0.10 * result["_sharpe_norm"]
+        + 0.10 * result["_ann_norm"]
+        + 0.05 * result["_win_norm"]
+        + 0.05 * result["_mdd_norm"]
+    )
     if "rank" in result.columns:
-        result = result.sort_values("rank").head(hold_num).reset_index(drop=True)
+        result["rank"] = pd.to_numeric(result["rank"], errors="coerce")
+    result = result.sort_values(
+        ["_risk_order", "_valuation_order", "composite_score", "rank", "_financial_score", "_score"],
+        ascending=[True, True, False, True, False, False],
+    )
+
+    candidates = result.drop(
+        columns=[
+            "_risk_order", "_valuation_order", "_financial_score", "_score",
+            "_ann_norm", "_mdd_norm", "_sharpe_norm", "_icir_norm", "_win_norm", "_score_norm",
+        ]
+    ).reset_index(drop=True)
+
+    if pred_date:
+        vol_df = _history_volatility(candidates["code"].astype(str).tolist(), pred_date, lookback_days=60)
+        candidates = candidates.merge(vol_df, on="code", how="left")
     else:
-        result = result.sort_values("score", ascending=False).head(hold_num).reset_index(drop=True)
+        candidates["volatility_60d"] = np.nan
+
+    candidates_csv = out_path / "second_screen_candidates.csv"
+    result = _apply_industry_cap(candidates, hold_num=hold_num, cap_ratio=0.40)
+    result = _apply_risk_parity_weights(result)
+
+    candidate_weights = _apply_risk_parity_weights(result.copy())[["code", "risk_parity_weight", "weight"]]
+    candidates = candidates.merge(candidate_weights, on="code", how="left")
+    candidates.to_csv(candidates_csv, index=False, encoding="utf-8-sig")
 
     print(f"\n◆ 二筛完成，选出 {len(result)} 只股票:")
     display_cols = ["code", "score", "rank", "rank_pct",
-                    "valuation_label", "risk_label",
+                    "percentile", "composite_score", "volatility_60d", "risk_parity_weight", "financial_label", "valuation_label", "risk_label",
                     "annualized_return", "max_drawdown", "sharpe_ratio", "ICIR", "monthly_win_rate"]
     display_cols = [c for c in display_cols if c in result.columns]
     print(result[display_cols].to_string(index=False))
@@ -84,6 +274,7 @@ def second_screen(risk_eval_csv: str, pred_dir: str,
     out_csv = out_path / "second_screen.csv"
     result.to_csv(out_csv, index=False, encoding="utf-8-sig")
     print(f"\n✓ 二筛结果保存: {out_csv}")
+    print(f"✓ 二筛完整候选池保存: {candidates_csv}")
 
 
 def main():

@@ -9,8 +9,10 @@ export_model_predict.py
     <output>/overview.html   — 图表化分析总览
 """
 import argparse
+import importlib
 import math
 import pickle
+import os
 import sys
 from pathlib import Path
 import warnings
@@ -19,10 +21,9 @@ import pandas as pd
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from qlib.contrib.report import analysis_position
+analysis_position = None
+analysis_model = None
+_ANALYSIS_IMPORT_ERROR = None
 
 warnings.filterwarnings("ignore")
 
@@ -74,6 +75,33 @@ def _normalize_index_datetime(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _load_qlib_report_modules():
+    global analysis_position, analysis_model, _ANALYSIS_IMPORT_ERROR
+    if analysis_position is not None or _ANALYSIS_IMPORT_ERROR is not None:
+        return analysis_position, analysis_model
+
+    original_sys_path = sys.path[:]
+    try:
+        blocked = {ROOT.resolve(), Path(os.getcwd()).resolve()}
+        cleaned = []
+        for entry in original_sys_path:
+            entry_path = Path(entry or ".").resolve()
+            if entry_path in blocked:
+                continue
+            cleaned.append(entry)
+        sys.path = cleaned
+        analysis_position = importlib.import_module("qlib.contrib.report.analysis_position")
+        analysis_model = importlib.import_module("qlib.contrib.report.analysis_model")
+    except Exception as exc:  # pragma: no cover - environment dependent
+        _ANALYSIS_IMPORT_ERROR = exc
+        analysis_position = None
+        analysis_model = None
+    finally:
+        sys.path = original_sys_path
+
+    return analysis_position, analysis_model
+
+
 def _robust_scale(series: pd.Series) -> pd.Series:
     """Robust z-score based on median and MAD, clipped to [-3, 3]."""
     s = pd.to_numeric(series, errors="coerce")
@@ -111,6 +139,116 @@ def _compute_ic_metrics(pred_df: pd.DataFrame, label_df: pd.DataFrame) -> dict:
     icir = ic_mean / ic_std if pd.notna(ic_mean) and pd.notna(ic_std) and ic_std not in (0, 0.0) else float("nan")
     rank_ic_mean = float(rank_ic_series.mean()) if len(rank_ic_series) else float("nan")
     return {"IC_mean": ic_mean, "IC_std": ic_std, "ICIR": icir, "rank_IC_mean": rank_ic_mean}
+
+
+def _fallback_report_figures(report_df: pd.DataFrame) -> list:
+    try:
+        go = importlib.import_module("plotly.graph_objects")
+        make_subplots = importlib.import_module("plotly.subplots").make_subplots
+    except Exception:
+        return []
+
+    if not isinstance(report_df, pd.DataFrame) or report_df.empty:
+        return []
+
+    rpt = _normalize_index_datetime(report_df)
+    required_cols = {"return", "cost", "bench", "turnover"}
+    if not required_cols.issubset(rpt.columns):
+        return []
+
+    cum_strategy = pd.to_numeric(rpt["return"], errors="coerce").fillna(0).cumsum()
+    cum_strategy_net = (pd.to_numeric(rpt["return"], errors="coerce") - pd.to_numeric(rpt["cost"], errors="coerce")).fillna(0).cumsum()
+    cum_bench = pd.to_numeric(rpt["bench"], errors="coerce").fillna(0).cumsum()
+    cum_excess = (pd.to_numeric(rpt["return"], errors="coerce") - pd.to_numeric(rpt["bench"], errors="coerce")).fillna(0).cumsum()
+    turnover = pd.to_numeric(rpt["turnover"], errors="coerce")
+    drawdown = cum_strategy_net - cum_strategy_net.cummax()
+
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        subplot_titles=("Cumulative Return", "Drawdown", "Turnover"),
+    )
+    fig.add_trace(go.Scatter(x=rpt.index, y=cum_bench, name="Benchmark", mode="lines"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=rpt.index, y=cum_strategy, name="Strategy Gross", mode="lines"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=rpt.index, y=cum_strategy_net, name="Strategy Net", mode="lines"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=rpt.index, y=cum_excess, name="Excess Gross", mode="lines"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=rpt.index, y=drawdown, name="Net Drawdown", mode="lines", fill="tozeroy"), row=2, col=1)
+    fig.add_trace(go.Bar(x=rpt.index, y=turnover.fillna(0), name="Turnover"), row=3, col=1)
+    fig.update_layout(height=980, title="Qlib-style Backtest Report", legend=dict(orientation="h"))
+    return [fig]
+
+
+def _fallback_ic_figures(pred_label: pd.DataFrame) -> list:
+    try:
+        go = importlib.import_module("plotly.graph_objects")
+    except Exception:
+        return []
+
+    if pred_label is None or pred_label.empty:
+        return []
+
+    joined = pred_label[["score", "label"]].dropna().copy()
+    if joined.empty:
+        return []
+
+    ic_df = joined.groupby(level="datetime", group_keys=False).apply(
+        lambda x: pd.Series({
+            "ic": x["label"].corr(x["score"]),
+            "rank_ic": x["label"].corr(x["score"], method="spearman"),
+        })
+    ).dropna(how="all")
+    if ic_df.empty:
+        return []
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=ic_df.index, y=ic_df["ic"], name="IC", mode="lines+markers"))
+    fig.add_trace(go.Scatter(x=ic_df.index, y=ic_df["rank_ic"], name="Rank IC", mode="lines+markers"))
+    fig.update_layout(title="Qlib-style Score IC", height=420)
+    return [fig]
+
+
+def _fallback_model_figures(pred_label: pd.DataFrame, groups: int = 5) -> list:
+    try:
+        go = importlib.import_module("plotly.graph_objects")
+    except Exception:
+        return []
+
+    if pred_label is None or pred_label.empty:
+        return []
+
+    joined = pred_label[["score", "label"]].dropna().copy()
+    if joined.empty:
+        return []
+
+    def _daily_group_return(x: pd.DataFrame) -> pd.Series:
+        x = x.sort_values("score", ascending=False)
+        n = len(x)
+        bucket = max(n // groups, 1)
+        top = x.iloc[:bucket]["label"].mean()
+        bottom = x.iloc[-bucket:]["label"].mean()
+        avg = x["label"].mean()
+        return pd.Series({"long_short": top - bottom, "long_avg": top - avg})
+
+    group_ret = joined.groupby(level="datetime", group_keys=False).apply(_daily_group_return).dropna(how="all")
+    auto_corr = joined.assign(prev_score=joined.groupby(level="instrument")["score"].shift(1)).groupby(level="datetime", group_keys=False).apply(
+        lambda x: x["score"].rank(pct=True).corr(x["prev_score"].rank(pct=True))
+    ).dropna()
+
+    figs = []
+    if not group_ret.empty:
+        fig1 = go.Figure()
+        fig1.add_trace(go.Scatter(x=group_ret.index, y=group_ret["long_short"].cumsum(), name="Long-Short", mode="lines"))
+        fig1.add_trace(go.Scatter(x=group_ret.index, y=group_ret["long_avg"].cumsum(), name="Long-Average", mode="lines"))
+        fig1.update_layout(title="Qlib-style Group Return", height=420)
+        figs.append(fig1)
+    if not auto_corr.empty:
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=auto_corr.index, y=auto_corr.values, name="Pred AutoCorr", mode="lines+markers"))
+        fig2.update_layout(title="Qlib-style Prediction Auto Correlation", height=420)
+        figs.append(fig2)
+    return figs
 
 
 def _extract_portfolio_metrics(port_analysis_df: pd.DataFrame, report_df: pd.DataFrame) -> dict:
@@ -153,7 +291,7 @@ def _extract_portfolio_metrics(port_analysis_df: pd.DataFrame, report_df: pd.Dat
     return metrics
 
 
-def _build_overview_html(out_path: Path, title: str, summary_metrics: dict, top_df: pd.DataFrame, figs: list, ic_figs: list):
+def _build_overview_html(out_path: Path, title: str, summary_metrics: dict, top_df: pd.DataFrame, figs: list, ic_figs: list, model_figs: list):
     def fmt(v):
         if v is None:
             return "N/A"
@@ -172,7 +310,7 @@ def _build_overview_html(out_path: Path, title: str, summary_metrics: dict, top_
     top_table = top_df.head(20).to_html(index=False, escape=False, classes="table table-sm table-striped")
 
     fig_html_parts = []
-    for i, fig in enumerate([*figs, *ic_figs], start=1):
+    for i, fig in enumerate([*figs, *ic_figs, *model_figs], start=1):
         fig_html_parts.append(fig.to_html(full_html=False, include_plotlyjs="cdn" if i == 1 else False))
 
     html = f"""<!doctype html>
@@ -276,25 +414,40 @@ def export_predict(run_dir: str, output_dir: str, pred_date: str):
         slice_df.index.name = "instrument"
         slice_df = slice_df.reset_index()
 
-    # 全截面排名（百分比，越小越好 = 分越高排名越靠前 1%）
+    # 全截面排名（仅输出实盘预测可用字段，不附带未来收益类信息）
     slice_df = slice_df.sort_values("score", ascending=False).reset_index(drop=True)
     n = len(slice_df)
     slice_df["rank"]       = range(1, n + 1)
     slice_df["rank_pct"]   = (slice_df["rank"] / n * 100).round(2).astype(str) + "%"
     slice_df["pred_date"]  = selected_pred_date
-    slice_df["expected_return"] = slice_df["score"]
+    slice_df["score_quantile"] = (1.0 - (slice_df["rank"] - 1) / max(n, 1)).round(6)
+    slice_df["percentile"] = slice_df["score_quantile"]
+    slice_df["quantile_bucket"] = np.select(
+        [
+            slice_df["rank"] <= max(int(np.ceil(n * 0.01)), 1),
+            slice_df["rank"] <= max(int(np.ceil(n * 0.05)), 1),
+            slice_df["rank"] <= max(int(np.ceil(n * 0.10)), 1),
+        ],
+        ["top_1pct", "top_5pct", "top_10pct"],
+        default="others",
+    )
+    slice_df["code"] = slice_df["instrument"].astype(str).str.replace(r'^[A-Za-z]+', '', regex=True).str.zfill(6)
+    slice_df["stock"] = slice_df["code"]
+    slice_df["date"] = slice_df["pred_date"]
 
-    # 稳健化分数：降低极端值对下游筛选的冲击
-    if "score" in slice_df.columns and len(slice_df) > 1:
-        robust_z = _robust_scale(slice_df["score"])
-        rank_score = 1.0 - (slice_df["rank"] - 1) / max(n - 1, 1)
-        slice_df["robust_score"] = (0.6 * robust_z + 0.4 * rank_score).round(6)
-        slice_df["score_z"] = robust_z.round(6)
-        slice_df["score_rank"] = rank_score.round(6)
-    else:
-        slice_df["robust_score"] = slice_df["score"]
-        slice_df["score_z"] = 0.0
-        slice_df["score_rank"] = 1.0
+    export_scores_df = slice_df[[
+        "stock",
+        "code",
+        "instrument",
+        "date",
+        "pred_date",
+        "score",
+        "rank",
+        "percentile",
+        "rank_pct",
+        "score_quantile",
+        "quantile_bucket",
+    ]].copy()
 
     # ── 2. 绩效指标 ─────────────────────────────
     portfolio_dir = artifacts / "portfolio_analysis"
@@ -335,35 +488,64 @@ def export_predict(run_dir: str, output_dir: str, pred_date: str):
             slice_df["score"].head(top_k).mean() - slice_df["score"].tail(bot_k).mean()
         )
 
-    # ── 3. 把绩效指标拼接到每行（供下游引用）────
-    for k, v in metrics.items():
-        slice_df[k] = round(v, 6) if not np.isnan(v) else float("nan")
-
-    # 兼容下游脚本可能期望的字段
-    if "IC_mean" in slice_df.columns:
-        slice_df["ICIR"] = slice_df["ICIR"]
-
     # ── 4. 写出 CSV ───────────────────────────
     scores_csv  = out_path / "scores.csv"
     metrics_csv = out_path / "metrics.csv"
     overview_html = out_path / "overview.html"
 
-    slice_df.to_csv(scores_csv, index=False, encoding="utf-8-sig")
+    export_scores_df.to_csv(scores_csv, index=False, encoding="utf-8-sig")
     pd.DataFrame([metrics]).to_csv(metrics_csv, index=False, encoding="utf-8-sig")
+
+    # ④ Export ALL test-period prediction dates for full-cycle backtest aggregation.
+    # all_scores.csv has every (datetime, instrument, score) in pred.pkl —
+    # used by _load_fold_scores in run_stage2_walk_forward.py.  scores.csv
+    # (single-date snapshot) is kept unchanged for stage3/4/5/6 downstream.
+    if pred_df is not None and not pred_df.empty and pred_df.index.nlevels == 2:
+        all_df = pred_df.reset_index().copy()
+        all_df.columns = [pred_df.index.names[0], pred_df.index.names[1], "score"][:len(all_df.columns)]
+        if len(all_df.columns) == 3:
+            all_df.columns = ["datetime", "instrument", "score"]
+        all_df["datetime"] = pd.to_datetime(all_df["datetime"]).dt.strftime("%Y-%m-%d")
+        all_df["score"] = pd.to_numeric(all_df["score"], errors="coerce")
+        all_df = all_df.dropna(subset=["score"])
+        all_df.to_csv(out_path / "all_scores.csv", index=False, encoding="utf-8-sig")
+        print(f"✓ 全周期得分已保存: {out_path / 'all_scores.csv'}  ({len(all_df)} 行, {all_df['datetime'].nunique()} 日期)")
 
     # ── 5. 生成图形化分析 HTML ─────────────────
     try:
         report_figs = []
         ic_figs = []
-        if isinstance(report_normal_df, pd.DataFrame) and not report_normal_df.empty:
-            rpt = _normalize_index_datetime(report_normal_df)
-            report_figs = list(analysis_position.report_graph(rpt, show_notebook=False))
+        model_figs = []
+        analysis_position_mod, analysis_model_mod = _load_qlib_report_modules()
+        if analysis_position_mod is not None:
+            if isinstance(report_normal_df, pd.DataFrame) and not report_normal_df.empty:
+                rpt = _normalize_index_datetime(report_normal_df)
+                report_figs = list(analysis_position_mod.report_graph(rpt, show_notebook=False))
 
-        pred_label = pred_df.join(label_df.rename(columns={label_df.columns[0]: "label"}), how="inner")
-        if not pred_label.empty:
-            pred_label = pred_label.dropna()
+            pred_label = pred_df.join(label_df.rename(columns={label_df.columns[0]: "label"}), how="inner")
             if not pred_label.empty:
-                ic_figs = list(analysis_position.score_ic_graph(pred_label, show_notebook=False))
+                pred_label = pred_label.dropna()
+                if not pred_label.empty:
+                    ic_figs = list(analysis_position_mod.score_ic_graph(pred_label, show_notebook=False))
+                    if analysis_model_mod is not None:
+                        model_figs = list(
+                            analysis_model_mod.model_performance_graph(
+                                pred_label,
+                                show_notebook=False,
+                                graph_names=["group_return", "pred_ic", "pred_autocorr"],
+                            )
+                        )
+        else:
+            print(f"⚠ analysis_position 不可用，跳过图表生成: {_ANALYSIS_IMPORT_ERROR}")
+
+        if not report_figs:
+            report_figs = _fallback_report_figures(report_normal_df)
+        if not ic_figs:
+            pred_label = pred_df.join(label_df.rename(columns={label_df.columns[0]: "label"}), how="inner")
+            ic_figs = _fallback_ic_figures(pred_label)
+        if not model_figs:
+            pred_label = pred_df.join(label_df.rename(columns={label_df.columns[0]: "label"}), how="inner")
+            model_figs = _fallback_model_figures(pred_label)
 
         _build_overview_html(
             overview_html,
@@ -379,9 +561,10 @@ def export_predict(run_dir: str, output_dir: str, pred_date: str):
                 "sharpe_ratio",
                 "information_ratio",
             ]},
-            top_df=slice_df,
+            top_df=export_scores_df,
             figs=report_figs,
             ic_figs=ic_figs,
+            model_figs=model_figs,
         )
         print(f"✓ 详细图表已保存: {overview_html}")
     except Exception as exc:
@@ -393,8 +576,8 @@ def export_predict(run_dir: str, output_dir: str, pred_date: str):
     for k, v in metrics.items():
         print(f"  {k:25s}: {v:.4f}" if not (isinstance(v, float) and np.isnan(v)) else f"  {k:25s}: N/A")
     print(f"\n◆ Top10 预测得分:")
-    cols = [c for c in ["instrument", "score", "expected_return", "rank", "rank_pct"] if c in slice_df.columns]
-    print(slice_df[cols].head(10).to_string(index=False))
+    cols = [c for c in ["instrument", "score", "rank", "rank_pct", "quantile_bucket"] if c in export_scores_df.columns]
+    print(export_scores_df[cols].head(10).to_string(index=False))
 
 
 def main():

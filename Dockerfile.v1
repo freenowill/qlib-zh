@@ -1,0 +1,48 @@
+FROM qlib-rdagent:latest
+
+ARG USE_CUDA=0
+ARG TORCH_CUDA=cpu
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        libomp-dev \
+        git \
+        python3-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip and wheel
+RUN python -m pip install --upgrade pip setuptools wheel
+
+# Install XGBoost, CatBoost and other python deps used in qlib examples
+RUN python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    xgboost catboost scipy==1.11.4 tables
+
+# Install build-time python deps required to compile qlib extensions
+RUN python -m pip install --upgrade cython numpy scikit-learn
+
+# Copy repository into image and install qlib (compile Cython extensions)
+WORKDIR /workspace/qlib
+COPY . /workspace/qlib
+RUN python -m pip install -e .
+
+# Install PyTorch (CPU by default). To install GPU wheels, build with --build-arg USE_CUDA=1 --build-arg TORCH_CUDA=<cuda_tag>
+RUN if [ "${USE_CUDA}" = "1" ]; then \
+      python -m pip install --index-url https://download.pytorch.org/whl/cu${TORCH_CUDA} torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu${TORCH_CUDA}; \
+    else \
+      python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio; \
+    fi
+
+# Sanity check
+RUN python - <<'PY'
+import importlib, sys
+for pkg in ('xgboost','torch'):
+    m = importlib.import_module(pkg)
+    print(pkg, getattr(m, '__version__', 'unknown'))
+PY
+
+LABEL maintainer="qlib-rdagent"

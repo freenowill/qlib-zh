@@ -9,6 +9,7 @@ import sys
 import os
 from pathlib import Path
 
+import pandas as pd
 import yaml
 
 
@@ -19,10 +20,11 @@ def validate_date_order(dates: dict) -> None:
     if missing:
         raise ValueError(f"Missing required dates: {missing}")
 
+    parsed = {k: pd.Timestamp(dates[k]) for k in keys}
     for left, right in zip(keys, keys[1:]):
-        if dates[left] >= dates[right]:
+        if parsed[left] >= parsed[right]:
             raise ValueError(
-                f"Invalid date order: {left}={dates[left]} must be earlier than {right}={dates[right]}"
+                f"Invalid date order: {left}={parsed[left].date()} must be earlier than {right}={parsed[right].date()}"
             )
 
 
@@ -100,9 +102,22 @@ def patch_yaml(
     # 3. 更新 port_analysis_config backtest 时间
     # ──────────────────────────────────────────
     pa = doc.get("port_analysis_config", {})
+    strategy = pa.get("strategy", {})
+    strategy_kwargs = strategy.get("kwargs", {})
+    hold_num = int(os.getenv("HOLD_NUM", "5") or 5)
+    cash_total = float(os.getenv("CASH_TOTAL", "10000") or 10000)
+    strategy_kwargs.update(
+        {
+            "topk": hold_num,
+            "n_drop": min(1, hold_num),
+            "hold_thresh": 1,
+            "only_tradable": True,
+        }
+    )
     bt = pa.get("backtest", {})
-    bt["start_time"] = dates["train_start"]
-    bt["end_time"]   = dates["valid_end"]
+    bt["start_time"] = dates["test_start"]
+    bt["end_time"]   = dates["test_end"]
+    bt["account"] = cash_total
 
     # ──────────────────────────────────────────
     # 4. 写出

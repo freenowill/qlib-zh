@@ -2,9 +2,9 @@
 """
 stage4_risk_eval.py
 对初筛的股票进行：
-  1. 财务标签  (优秀 / 良好 / 一般 / 较差 / 很差)
-  2. 估值标签  (高估值 / 正常估值 / 低估值)
-  3. 风险标签  (高风险 / 中风险 / 低风险)
+    1. 财务标签  (优 / 良 / 中 / 差)
+    2. 估值标签  (高 / 中 / 低)
+    3. 风险标签  (高 / 中 / 低)
 数据源：baostock 公共接口
 说明：
   - 利润、偿债、营运、成长、杜邦、业绩快报用于财务评分
@@ -15,6 +15,7 @@ stage4_risk_eval.py
 from __future__ import annotations
 
 import argparse
+import importlib
 import re
 import time
 import warnings
@@ -26,10 +27,12 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
-try:
-    import baostock as bs
-except Exception as exc:  # pragma: no cover - environment dependent
-    raise SystemExit(f"baostock 未安装或无法导入: {exc}") from exc
+
+def _bs():
+    try:
+        return importlib.import_module("baostock")
+    except Exception as exc:  # pragma: no cover - environment dependent
+        raise SystemExit(f"baostock 未安装或无法导入: {exc}") from exc
 
 
 NEGATIVE_KEYWORDS = ("预亏", "预减", "亏损", "下滑", "下降", "减少", "低于", "转亏", "恶化")
@@ -90,16 +93,14 @@ def _percentify(value):
     return v
 
 
-def _label_from_score(score: float) -> str:
+def _financial_label_from_score(score: float) -> str:
     if score >= 80:
-        return "优秀"
+        return "优"
     if score >= 65:
-        return "良好"
+        return "良"
     if score >= 50:
-        return "一般"
-    if score >= 35:
-        return "较差"
-    return "很差"
+        return "中"
+    return "差"
 
 
 def _valuation_label(pe: float, pb: float, ps: float) -> str:
@@ -114,19 +115,19 @@ def _valuation_label(pe: float, pb: float, ps: float) -> str:
             elif value < low_th:
                 low += 1
     if total == 0:
-        return "正常估值"
+        return "中"
     if high / total >= 0.5:
-        return "高估值"
+        return "高"
     if low / total >= 0.5:
-        return "低估值"
-    return "正常估值"
+        return "低"
+    return "中"
 
 
 def _risk_label(financial_label: str, valuation_label: str, negative_news_count: int, is_st: bool, is_suspended: bool, tradestatus: bool) -> str:
     score = 0
-    if financial_label in {"较差", "很差"}:
+    if financial_label == "差":
         score += 2
-    if valuation_label == "高估值":
+    if valuation_label == "高":
         score += 1
     if negative_news_count >= 3:
         score += 2
@@ -137,13 +138,14 @@ def _risk_label(financial_label: str, valuation_label: str, negative_news_count:
     if is_suspended or not tradestatus:
         score += 3
     if score >= 5:
-        return "高风险"
+        return "高"
     if score >= 2:
-        return "中风险"
-    return "低风险"
+        return "中"
+    return "低"
 
 
 def _login():
+    bs = _bs()
     lg = bs.login()
     if lg.error_code != "0":
         raise RuntimeError(f"baostock login failed: {lg.error_code} {lg.error_msg}")
@@ -151,6 +153,7 @@ def _login():
 
 def _logout():
     try:
+        bs = _bs()
         bs.logout()
     except Exception:
         pass
@@ -166,6 +169,7 @@ def _rs_to_df(rs) -> pd.DataFrame:
 
 
 def _latest_daily_snapshot(code: str, pred_date: str) -> dict:
+    bs = _bs()
     bs_code = _to_bs_code(code)
     start_date = (pd.to_datetime(pred_date) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
     rs = bs.query_history_k_data_plus(
@@ -200,6 +204,7 @@ def _latest_daily_snapshot(code: str, pred_date: str) -> dict:
 
 
 def _latest_stock_basic(code: str) -> dict:
+    bs = _bs()
     rs = bs.query_stock_basic(code=_to_bs_code(code))
     df = _rs_to_df(rs)
     if df.empty:
@@ -208,7 +213,31 @@ def _latest_stock_basic(code: str) -> dict:
     return {"ipo_date": pd.to_datetime(row.get("ipoDate"), errors="coerce")}
 
 
-def _latest_financial_bundle(code: str, q: Quarter) -> dict:
+def _latest_stock_industry(code: str) -> str:
+    bs = _bs()
+    bs_code = _to_bs_code(code)
+    query = getattr(bs, "query_stock_industry", None)
+    if query is None:
+        return "未知"
+    try:
+        rs = query(code=bs_code)
+        df = _rs_to_df(rs)
+        if df.empty:
+            return "未知"
+        row = df.iloc[-1]
+        for col in ["industry", "industryName", "industry_type", "industryType", "classify"]:
+            value = row.get(col)
+            if pd.notna(value) and str(value).strip():
+                return str(value).strip()
+        if len(row) > 0:
+            return str(row.iloc[-1]).strip() or "未知"
+    except Exception:
+        pass
+    return "未知"
+
+
+def _latest_financial_bundle(code: str, q: Quarter, pred_date: str) -> dict:
+    bs = _bs()
     bs_code = _to_bs_code(code)
     out = {
         "roeAvg": np.nan,
@@ -275,8 +304,9 @@ def _latest_financial_bundle(code: str, q: Quarter) -> dict:
             out[k] = pd.to_numeric(row.get(k), errors="coerce")
 
     # 负面公告 proxy：业绩预告 + 业绩快报
-    start_30 = (pd.Timestamp.today() - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
-    end_30 = pd.Timestamp.today().strftime("%Y-%m-%d")
+    ref_dt = pd.to_datetime(pred_date)
+    start_30 = (ref_dt - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+    end_30 = ref_dt.strftime("%Y-%m-%d")
     neg_cnt = 0
     for rs in [
         bs.query_forecast_report(bs_code, start_date=start_30, end_date=end_30),
@@ -329,67 +359,76 @@ def _financial_score(bundle: dict) -> tuple[float, dict[str, float]]:
 
 def risk_eval(input_csv: str, output_dir: str, pred_date: str):
     _login()
-    out_path = Path(output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
+    try:
+        out_path = Path(output_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
 
-    pool = pd.read_csv(input_csv)
-    if "code" not in pool.columns and "instrument" in pool.columns:
-        pool["code"] = pool["instrument"].astype(str)
-    pool["code"] = pool["code"].astype(str).map(_to_6digit)
-    print(f"✓ 加载初筛结果: {len(pool)} 只股票")
+        pool = pd.read_csv(input_csv)
+        if "pred_date" in pool.columns and not pool["pred_date"].dropna().empty:
+            file_pred_date = str(pool["pred_date"].dropna().astype(str).iloc[0])
+            if file_pred_date != pred_date:
+                print(f"  ⚠ 输入 pred_date={pred_date} 与初筛文件中的 pred_date={file_pred_date} 不一致，已自动对齐为后者")
+                pred_date = file_pred_date
+        if "code" not in pool.columns and "instrument" in pool.columns:
+            pool["code"] = pool["instrument"].astype(str)
+        pool["code"] = pool["code"].astype(str).map(_to_6digit)
+        print(f"✓ 加载初筛结果: {len(pool)} 只股票")
 
-    q = _quarter_of_date(pred_date)
-    rows = []
-    t0 = time.perf_counter()
-    for i, row in pool.iterrows():
-        code = str(row["code"]).zfill(6)
-        print(f"  [{i+1}/{len(pool)}] 评估 {code}...")
+        q = _quarter_of_date(pred_date)
+        rows = []
+        t0 = time.perf_counter()
+        for i, row in pool.iterrows():
+            code = str(row["code"]).zfill(6)
+            print(f"  [{i+1}/{len(pool)}] 评估 {code}...")
 
-        daily = _latest_daily_snapshot(code, pred_date)
-        basic = _latest_stock_basic(code)
-        bundle = _latest_financial_bundle(code, q)
-        fin_score, dims = _financial_score(bundle)
-        financial_label = _label_from_score(fin_score)
-        valuation_label = _valuation_label(daily["pe_ttm"], daily["pb"], daily["ps"])
-        risk_label = _risk_label(
-            financial_label,
-            valuation_label,
-            int(bundle.get("negative_news_count", 0) or 0),
-            bool(daily.get("is_st", False)),
-            not bool(daily.get("tradestatus", True)),
-            bool(daily.get("tradestatus", True)),
-        )
+            daily = _latest_daily_snapshot(code, pred_date)
+            basic = _latest_stock_basic(code)
+            industry = _latest_stock_industry(code)
+            bundle = _latest_financial_bundle(code, q, pred_date)
+            fin_score, dims = _financial_score(bundle)
+            financial_label = _financial_label_from_score(fin_score)
+            valuation_label = _valuation_label(daily["pe_ttm"], daily["pb"], daily["ps"])
+            risk_label = _risk_label(
+                financial_label,
+                valuation_label,
+                int(bundle.get("negative_news_count", 0) or 0),
+                bool(daily.get("is_st", False)),
+                not bool(daily.get("tradestatus", True)),
+                bool(daily.get("tradestatus", True)),
+            )
 
-        rows.append({
-            **row.to_dict(),
-            "ipo_date": basic.get("ipo_date", pd.NaT),
-            "close": daily["close"],
-            "pe_ttm": daily["pe_ttm"],
-            "pb": daily["pb"],
-            "ps": daily["ps"],
-            "financial_score": round(fin_score, 2) if pd.notna(fin_score) else "",
-            "financial_label": financial_label,
-            "valuation_label": valuation_label,
-            "negative_news_count": int(bundle.get("negative_news_count", 0) or 0),
-            "risk_label": risk_label,
-            "is_st": bool(daily.get("is_st", False)),
-            "is_suspended": not bool(daily.get("tradestatus", True)),
-            "prof_score": round(dims["prof"], 2) if pd.notna(dims["prof"]) else "",
-            "solv_score": round(dims["solv"], 2) if pd.notna(dims["solv"]) else "",
-            "oper_score": round(dims["oper"], 2) if pd.notna(dims["oper"]) else "",
-            "grow_score": round(dims["grow"], 2) if pd.notna(dims["grow"]) else "",
-        })
+            rows.append({
+                **row.to_dict(),
+                "ipo_date": basic.get("ipo_date", pd.NaT),
+                "close": daily["close"],
+                "pe_ttm": daily["pe_ttm"],
+                "pb": daily["pb"],
+                "ps": daily["ps"],
+                "industry": industry,
+                "financial_score": round(fin_score, 2) if pd.notna(fin_score) else "",
+                "financial_label": financial_label,
+                "valuation_label": valuation_label,
+                "negative_news_count": int(bundle.get("negative_news_count", 0) or 0),
+                "risk_label": risk_label,
+                "is_st": bool(daily.get("is_st", False)),
+                "is_suspended": not bool(daily.get("tradestatus", True)),
+                "prof_score": round(dims["prof"], 2) if pd.notna(dims["prof"]) else "",
+                "solv_score": round(dims["solv"], 2) if pd.notna(dims["solv"]) else "",
+                "oper_score": round(dims["oper"], 2) if pd.notna(dims["oper"]) else "",
+                "grow_score": round(dims["grow"], 2) if pd.notna(dims["grow"]) else "",
+            })
 
-    result = pd.DataFrame(rows)
-    out_csv = out_path / "risk_eval.csv"
-    result.to_csv(out_csv, index=False, encoding="utf-8-sig")
+        result = pd.DataFrame(rows)
+        out_csv = out_path / "risk_eval.csv"
+        result.to_csv(out_csv, index=False, encoding="utf-8-sig")
 
-    print(f"\n✓ 风险评估耗时 {time.perf_counter() - t0:.1f}s")
-    print("\n◆ 风险评估完毕:")
-    display_cols = [c for c in ["code", "financial_label", "valuation_label", "risk_label", "financial_score", "negative_news_count", "pe_ttm", "pb", "ps"] if c in result.columns]
-    print(result[display_cols].to_string(index=False))
-    print(f"\n✓ 风险评估保存: {out_csv}")
-    _logout()
+        print(f"\n✓ 风险评估耗时 {time.perf_counter() - t0:.1f}s")
+        print("\n◆ 风险评估完毕:")
+        display_cols = [c for c in ["code", "financial_label", "valuation_label", "risk_label", "financial_score", "negative_news_count", "pe_ttm", "pb", "ps"] if c in result.columns]
+        print(result[display_cols].to_string(index=False))
+        print(f"\n✓ 风险评估保存: {out_csv}")
+    finally:
+        _logout()
 
 
 def main():

@@ -1,0 +1,510 @@
+============================================================
+  run_alpha158_practice
+  experiment : test_stage2_weekly_smoke2
+  T (本周五) : 2026-04-10
+  训练集     : 2020-04-01 ~ 2025-04-01
+  验证集     : 2025-04-02 ~ 2026-04-02
+  测试集     : 2026-04-03 ~ 2026-04-09
+  预测日期   : 2026-04-09
+  半衰期     : 63
+  步移(周)   : 1
+  滚动起点   : 2013-01-01
+  滚动终点   : 2013-01-18
+  分段(年)   : 1
+  stage      : 2 → 2
+  output     : /Users/apple/gitee/qlib/DATA/analysis_outputs/test_stage2_weekly_smoke2
+============================================================
+
+╔══════════════════════════════════════════╗
+║  STAGE 2 — Walk-forward 训练与预测     ║
+╚══════════════════════════════════════════╝
+[1/3] 启动 Docker 容器并运行 walk-forward stage2
+[1:MainThread](2026-04-03 16:14:37,450) INFO - qlib.Initialization - [config.py:453] - default_conf: client.
+[1:MainThread](2026-04-03 16:14:38,571) INFO - qlib.Initialization - [__init__.py:82] - qlib successfully initialized based on client settings.
+[1:MainThread](2026-04-03 16:14:38,574) INFO - qlib.Initialization - [__init__.py:84] - data_path={'__DEFAULT_FREQ': PosixPath('/root/.qlib/qlib_data/cn_data')}
+═══════════════════════════════════════════════
+Walk-forward stage2 plan
+  window  : train=5y valid=1y test=1 week
+  stride  : 1 week(s)
+  range   : 2013-01-01 -> 2013-01-18
+  segment : 1 year(s)
+  [0001/0002] signal=2013-01-04 test=2013-01-04 ~ 2013-01-11 train=2008-01-02 ~ 2011-12-30 valid=2012-01-04 ~ 2012-12-31
+  [0002/0002] signal=2013-01-11 test=2013-01-11 ~ 2013-01-18 train=2008-01-02 ~ 2012-01-10 valid=2012-01-11 ~ 2013-01-10
+═══════════════════════════════════════════════
+
+════════════ Segment 2013-2013 (2 folds) ════════════
+
+[1/2] Fold 2013-01-04: 2008-01-02 ~ 2011-12-30 | 2012-01-04 ~ 2012-12-31 | 2013-01-04 ~ 2013-01-11
+✓ YAML 已写出: /work/DATA/analysis_outputs/test_stage2_weekly_smoke2/model_predict/walk_forward/2013-01-04/workflow_config_practice.yaml
+  train : 2008-01-02 → 2011-12-30
+  valid : 2012-01-04 → 2012-12-31
+  test  : 2013-01-04  → 2013-01-11
+[32:MainThread](2026-04-03 16:14:43,134) INFO - qlib.Initialization - [config.py:453] - default_conf: client.
+[32:MainThread](2026-04-03 16:14:43,140) INFO - qlib.Initialization - [__init__.py:82] - qlib successfully initialized based on client settings.
+[32:MainThread](2026-04-03 16:14:43,140) INFO - qlib.Initialization - [__init__.py:84] - data_path={'__DEFAULT_FREQ': PosixPath('/root/.qlib/qlib_data/cn_data')}
+WARNING:root:Malformed experiment '772469154568584692'. Detailed error Yaml file '/work/mlruns/772469154568584692/meta.yaml' does not exist.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 368, in search_experiments
+    exp = self._get_experiment(exp_id, view_type)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 466, in _get_experiment
+    meta = FileStore._read_yaml(experiment_dir, FileStore.META_DATA_FILE_NAME)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 1636, in _read_yaml
+    return _read_helper(root, file_name, attempts_remaining=retries)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 1629, in _read_helper
+    result = read_yaml(root, file_name)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/utils/yaml_utils.py", line 107, in read_yaml
+    raise MissingConfigException(f"Yaml file '{file_path}' does not exist.")
+mlflow.exceptions.MissingConfigException: Yaml file '/work/mlruns/772469154568584692/meta.yaml' does not exist.
+WARNING:root:Malformed experiment '912954655527694157'. Detailed error Yaml file '/work/mlruns/912954655527694157/meta.yaml' does not exist.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 368, in search_experiments
+    exp = self._get_experiment(exp_id, view_type)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 466, in _get_experiment
+    meta = FileStore._read_yaml(experiment_dir, FileStore.META_DATA_FILE_NAME)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 1636, in _read_yaml
+    return _read_helper(root, file_name, attempts_remaining=retries)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 1629, in _read_helper
+    result = read_yaml(root, file_name)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/utils/yaml_utils.py", line 107, in read_yaml
+    raise MissingConfigException(f"Yaml file '{file_path}' does not exist.")
+mlflow.exceptions.MissingConfigException: Yaml file '/work/mlruns/912954655527694157/meta.yaml' does not exist.
+[32:MainThread](2026-04-03 16:14:43,208) WARNING - qlib.workflow - [expm.py:230] - No valid experiment found. Create a new experiment with name test_stage2_weekly_smoke2_wf_2013-01-04.
+WARNING:root:Malformed experiment '772469154568584692'. Detailed error Yaml file '/work/mlruns/772469154568584692/meta.yaml' does not exist.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/site-packages/qlib/workflow/expm.py", line 390, in _get_exp
+    raise MlflowException("No valid experiment has been found.")
+mlflow.exceptions.MlflowException: No valid experiment has been found.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/site-packages/qlib/workflow/expm.py", line 224, in _get_or_create_exp
+    self._get_exp(experiment_id=experiment_id, experiment_name=experiment_name),
+  File "/usr/local/lib/python3.10/site-packages/qlib/workflow/expm.py", line 394, in _get_exp
+    raise ValueError(
+ValueError: No valid experiment has been found, please make sure the input experiment name is correct.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 368, in search_experiments
+    exp = self._get_experiment(exp_id, view_type)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 466, in _get_experiment
+    meta = FileStore._read_yaml(experiment_dir, FileStore.META_DATA_FILE_NAME)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 1636, in _read_yaml
+    return _read_helper(root, file_name, attempts_remaining=retries)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 1629, in _read_helper
+    result = read_yaml(root, file_name)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/utils/yaml_utils.py", line 107, in read_yaml
+    raise MissingConfigException(f"Yaml file '{file_path}' does not exist.")
+mlflow.exceptions.MissingConfigException: Yaml file '/work/mlruns/772469154568584692/meta.yaml' does not exist.
+WARNING:root:Malformed experiment '912954655527694157'. Detailed error Yaml file '/work/mlruns/912954655527694157/meta.yaml' does not exist.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/site-packages/qlib/workflow/expm.py", line 390, in _get_exp
+    raise MlflowException("No valid experiment has been found.")
+mlflow.exceptions.MlflowException: No valid experiment has been found.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/site-packages/qlib/workflow/expm.py", line 224, in _get_or_create_exp
+    self._get_exp(experiment_id=experiment_id, experiment_name=experiment_name),
+  File "/usr/local/lib/python3.10/site-packages/qlib/workflow/expm.py", line 394, in _get_exp
+    raise ValueError(
+ValueError: No valid experiment has been found, please make sure the input experiment name is correct.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 368, in search_experiments
+    exp = self._get_experiment(exp_id, view_type)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 466, in _get_experiment
+    meta = FileStore._read_yaml(experiment_dir, FileStore.META_DATA_FILE_NAME)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 1636, in _read_yaml
+    return _read_helper(root, file_name, attempts_remaining=retries)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 1629, in _read_helper
+    result = read_yaml(root, file_name)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/utils/yaml_utils.py", line 107, in read_yaml
+    raise MissingConfigException(f"Yaml file '{file_path}' does not exist.")
+mlflow.exceptions.MissingConfigException: Yaml file '/work/mlruns/912954655527694157/meta.yaml' does not exist.
+[32:MainThread](2026-04-03 16:14:43,247) INFO - qlib.workflow - [exp.py:258] - Experiment 384522500357652302 starts running ...
+[32:MainThread](2026-04-03 16:14:43,840) INFO - qlib.workflow - [recorder.py:345] - Recorder 592812ad4e4240aa850f344a79c73c01 starts running under Experiment 384522500357652302 ...
+ModuleNotFoundError. CatBoostModel are skipped. (optional: maybe installing CatBoostModel can fix it.)
+ModuleNotFoundError. XGBModel is skipped(optional: maybe installing xgboost can fix it).
+ModuleNotFoundError.  PyTorch models are skipped (optional: maybe installing pytorch can fix it).
+[32:MainThread](2026-04-03 16:16:35,766) INFO - qlib.timer - [log.py:127] - Time cost: 111.096s | Loading data Done
+[32:MainThread](2026-04-03 16:16:35,976) INFO - qlib.timer - [log.py:127] - Time cost: 0.085s | DropnaLabel Done
+[32:MainThread](2026-04-03 16:16:37,749) INFO - qlib.timer - [log.py:127] - Time cost: 1.773s | CSZScoreNorm Done
+[32:MainThread](2026-04-03 16:16:37,751) INFO - qlib.timer - [log.py:127] - Time cost: 1.982s | fit & process data Done
+[32:MainThread](2026-04-03 16:16:37,752) INFO - qlib.timer - [log.py:127] - Time cost: 113.085s | Init data Done
+Training until validation scores don't improve for 50 rounds
+[20]	train's l2: 0.981185	valid's l2: 0.993226
+[40]	train's l2: 0.969806	valid's l2: 0.992967
+[60]	train's l2: 0.960443	valid's l2: 0.992879
+[80]	train's l2: 0.952501	valid's l2: 0.992882
+[100]	train's l2: 0.944878	valid's l2: 0.993496
+Early stopping, best iteration is:
+[58]	train's l2: 0.961264	valid's l2: 0.992818
+[32:MainThread](2026-04-03 16:17:09,298) INFO - qlib.fill_placeholder - [__init__.py:798] - <PRED> lookes like a placeholder, but it can't match to any given values
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+'The following are prediction results of the LGBModel model.'
+[32:MainThread](2026-04-03 16:17:09,447) INFO - qlib.workflow - [record_temp.py:197] - Signal record 'pred.pkl' has been saved as the artifact of the Experiment 384522500357652302
+                          score
+datetime   instrument          
+2013-01-04 SH600000   -0.139644
+           SH600005   -0.012637
+           SH600009   -0.040478
+           SH600010   -0.048544
+           SH600011    0.104261
+Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]
+Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]Downloading artifacts: 100%|██████████| 1/1 [00:00<00:00, 551.01it/s]Downloading artifacts: 100%|██████████| 1/1 [00:00<00:00, 495.37it/s]
+Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]
+Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]Downloading artifacts: 100%|██████████| 1/1 [00:00<00:00, 553.34it/s]Downloading artifacts: 100%|██████████| 1/1 [00:00<00:00, 498.08it/s]
+{'IC': np.float64(0.0755858119445993),
+ 'ICIR': np.float64(0.43900883690401715),
+ 'Rank IC': np.float64(0.11416440581899129),
+ 'Rank ICIR': np.float64(0.7126819525687862)}
+Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]
+Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]Downloading artifacts: 100%|██████████| 1/1 [00:00<00:00, 636.08it/s]Downloading artifacts: 100%|██████████| 1/1 [00:00<00:00, 525.34it/s]
+[32:MainThread](2026-04-03 16:17:10,520) INFO - qlib.backtest caller - [__init__.py:93] - Create new exchange
+[32:MainThread](2026-04-03 16:17:53,714) WARNING - qlib.online operator - [exchange.py:219] - $close field data contains nan.
+[32:MainThread](2026-04-03 16:17:53,716) WARNING - qlib.online operator - [exchange.py:219] - $close field data contains nan.
+[32:MainThread](2026-04-03 16:17:55,570) WARNING - qlib.BaseExecutor - [executor.py:121] - `common_infra` is not set for <qlib.backtest.executor.SimulatorExecutor object at 0x7f173481f2e0>
+backtest loop:   0%|          | 0/6 [00:00<?, ?it/s]/usr/local/lib/python3.10/site-packages/qlib/utils/index_data.py:492: RuntimeWarning: Mean of empty slice
+  return np.nanmean(self.data)
+backtest loop: 100%|██████████| 6/6 [00:00<00:00, 49.58it/s]backtest loop: 100%|██████████| 6/6 [00:00<00:00, 49.39it/s]
+'The following are analysis results of benchmark return(1day).'
+[32:MainThread](2026-04-03 16:17:55,725) INFO - qlib.workflow - [record_temp.py:520] - Portfolio analysis record 'port_analysis_1day.pkl' has been saved as the artifact of the Experiment 384522500357652302
+                       risk
+mean              -0.002612
+std                0.008382
+annualized_return -0.621596
+information_ratio -4.807122
+max_drawdown      -0.020836
+'The following are analysis results of the excess return without cost(1day).'
+                       risk
+mean               0.004411
+std                0.009113
+annualized_return  1.049867
+information_ratio  7.467257
+max_drawdown      -0.004587
+'The following are analysis results of the excess return with cost(1day).'
+                       risk
+mean               0.004196
+std                0.009135
+annualized_return  0.998645
+information_ratio  7.086528
+max_drawdown      -0.005052
+'The following are analysis results of indicators(1day).'
+[32:MainThread](2026-04-03 16:17:55,749) INFO - qlib.workflow - [record_temp.py:545] - Indicator analysis record 'indicator_analysis_1day.pkl' has been saved as the artifact of the Experiment 384522500357652302
+     value
+ffr    1.0
+pa     0.0
+pos    0.0
+[32:MainThread](2026-04-03 16:17:55,989) INFO - qlib.timer - [log.py:127] - Time cost: 0.178s | waiting `async_log` Done
+#### Do not import qlib package in the repository directory in case of importing qlib from . without compiling #####
+pred.pkl loaded, shape=(1800, 1), index levels=2
+⚠ analysis_position 不可用，跳过图表生成: No module named 'qlib.data._libs.rolling'
+✓ 详细图表已保存: /work/DATA/analysis_outputs/test_stage2_weekly_smoke2/model_predict/walk_forward/2013-01-04/model_predict/overview.html
+✓ 得分表已保存: /work/DATA/analysis_outputs/test_stage2_weekly_smoke2/model_predict/walk_forward/2013-01-04/model_predict/scores.csv  (300 行)
+✓ 指标表已保存: /work/DATA/analysis_outputs/test_stage2_weekly_smoke2/model_predict/walk_forward/2013-01-04/model_predict/metrics.csv
+
+═══ 绩效摘要 ═══
+  IC_mean                  : 0.0756
+  IC_std                   : 0.1722
+  ICIR                     : 0.4390
+  rank_IC_mean             : 0.1142
+  annualized_return        : 0.9986
+  max_drawdown             : -0.0051
+  monthly_win_rate         : 1.0000
+  sharpe_ratio             : 7.2920
+  information_ratio        : 7.0865
+  excess_return_with_cost_mean: 0.0042
+  excess_return_without_cost_mean: 0.0044
+  ffr                      : 1.0000
+  pa                       : 0.0000
+  pos                      : 0.0000
+  score_mean               : -0.0391
+  score_std                : 0.0773
+  score_spread_top_bottom  : 0.3280
+
+◆ Top10 预测得分:
+instrument    score  rank rank_pct quantile_bucket
+  SH600256 0.208579     1    0.33%        top_1pct
+  SH600062 0.203640     2    0.67%        top_1pct
+  SZ002385 0.148005     3     1.0%        top_1pct
+  SZ002375 0.121997     4    1.33%        top_5pct
+  SH600166 0.119219     5    1.67%        top_5pct
+  SZ000528 0.114612     6     2.0%        top_5pct
+  SZ000883 0.113689     7    2.33%        top_5pct
+  SH601933 0.112109     8    2.67%        top_5pct
+  SH600027 0.109848     9     3.0%        top_5pct
+  SZ002353 0.104941    10    3.33%        top_5pct
+
+[2/2] Fold 2013-01-11: 2008-01-02 ~ 2012-01-10 | 2012-01-11 ~ 2013-01-10 | 2013-01-11 ~ 2013-01-18
+✓ YAML 已写出: /work/DATA/analysis_outputs/test_stage2_weekly_smoke2/model_predict/walk_forward/2013-01-11/workflow_config_practice.yaml
+  train : 2008-01-02 → 2012-01-10
+  valid : 2012-01-11 → 2013-01-10
+  test  : 2013-01-11  → 2013-01-18
+[156:MainThread](2026-04-03 16:18:08,860) INFO - qlib.Initialization - [config.py:453] - default_conf: client.
+[156:MainThread](2026-04-03 16:18:08,864) INFO - qlib.Initialization - [__init__.py:82] - qlib successfully initialized based on client settings.
+[156:MainThread](2026-04-03 16:18:08,865) INFO - qlib.Initialization - [__init__.py:84] - data_path={'__DEFAULT_FREQ': PosixPath('/root/.qlib/qlib_data/cn_data')}
+WARNING:root:Malformed experiment '772469154568584692'. Detailed error Yaml file '/work/mlruns/772469154568584692/meta.yaml' does not exist.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 368, in search_experiments
+    exp = self._get_experiment(exp_id, view_type)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 466, in _get_experiment
+    meta = FileStore._read_yaml(experiment_dir, FileStore.META_DATA_FILE_NAME)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 1636, in _read_yaml
+    return _read_helper(root, file_name, attempts_remaining=retries)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 1629, in _read_helper
+    result = read_yaml(root, file_name)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/utils/yaml_utils.py", line 107, in read_yaml
+    raise MissingConfigException(f"Yaml file '{file_path}' does not exist.")
+mlflow.exceptions.MissingConfigException: Yaml file '/work/mlruns/772469154568584692/meta.yaml' does not exist.
+WARNING:root:Malformed experiment '912954655527694157'. Detailed error Yaml file '/work/mlruns/912954655527694157/meta.yaml' does not exist.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 368, in search_experiments
+    exp = self._get_experiment(exp_id, view_type)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 466, in _get_experiment
+    meta = FileStore._read_yaml(experiment_dir, FileStore.META_DATA_FILE_NAME)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 1636, in _read_yaml
+    return _read_helper(root, file_name, attempts_remaining=retries)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 1629, in _read_helper
+    result = read_yaml(root, file_name)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/utils/yaml_utils.py", line 107, in read_yaml
+    raise MissingConfigException(f"Yaml file '{file_path}' does not exist.")
+mlflow.exceptions.MissingConfigException: Yaml file '/work/mlruns/912954655527694157/meta.yaml' does not exist.
+[156:MainThread](2026-04-03 16:18:08,917) WARNING - qlib.workflow - [expm.py:230] - No valid experiment found. Create a new experiment with name test_stage2_weekly_smoke2_wf_2013-01-11.
+WARNING:root:Malformed experiment '772469154568584692'. Detailed error Yaml file '/work/mlruns/772469154568584692/meta.yaml' does not exist.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/site-packages/qlib/workflow/expm.py", line 390, in _get_exp
+    raise MlflowException("No valid experiment has been found.")
+mlflow.exceptions.MlflowException: No valid experiment has been found.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/site-packages/qlib/workflow/expm.py", line 224, in _get_or_create_exp
+    self._get_exp(experiment_id=experiment_id, experiment_name=experiment_name),
+  File "/usr/local/lib/python3.10/site-packages/qlib/workflow/expm.py", line 394, in _get_exp
+    raise ValueError(
+ValueError: No valid experiment has been found, please make sure the input experiment name is correct.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 368, in search_experiments
+    exp = self._get_experiment(exp_id, view_type)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 466, in _get_experiment
+    meta = FileStore._read_yaml(experiment_dir, FileStore.META_DATA_FILE_NAME)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 1636, in _read_yaml
+    return _read_helper(root, file_name, attempts_remaining=retries)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 1629, in _read_helper
+    result = read_yaml(root, file_name)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/utils/yaml_utils.py", line 107, in read_yaml
+    raise MissingConfigException(f"Yaml file '{file_path}' does not exist.")
+mlflow.exceptions.MissingConfigException: Yaml file '/work/mlruns/772469154568584692/meta.yaml' does not exist.
+WARNING:root:Malformed experiment '912954655527694157'. Detailed error Yaml file '/work/mlruns/912954655527694157/meta.yaml' does not exist.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/site-packages/qlib/workflow/expm.py", line 390, in _get_exp
+    raise MlflowException("No valid experiment has been found.")
+mlflow.exceptions.MlflowException: No valid experiment has been found.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/site-packages/qlib/workflow/expm.py", line 224, in _get_or_create_exp
+    self._get_exp(experiment_id=experiment_id, experiment_name=experiment_name),
+  File "/usr/local/lib/python3.10/site-packages/qlib/workflow/expm.py", line 394, in _get_exp
+    raise ValueError(
+ValueError: No valid experiment has been found, please make sure the input experiment name is correct.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 368, in search_experiments
+    exp = self._get_experiment(exp_id, view_type)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 466, in _get_experiment
+    meta = FileStore._read_yaml(experiment_dir, FileStore.META_DATA_FILE_NAME)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 1636, in _read_yaml
+    return _read_helper(root, file_name, attempts_remaining=retries)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/store/tracking/file_store.py", line 1629, in _read_helper
+    result = read_yaml(root, file_name)
+  File "/usr/local/lib/python3.10/site-packages/mlflow/utils/yaml_utils.py", line 107, in read_yaml
+    raise MissingConfigException(f"Yaml file '{file_path}' does not exist.")
+mlflow.exceptions.MissingConfigException: Yaml file '/work/mlruns/912954655527694157/meta.yaml' does not exist.
+[156:MainThread](2026-04-03 16:18:08,971) INFO - qlib.workflow - [exp.py:258] - Experiment 429352785627166390 starts running ...
+[156:MainThread](2026-04-03 16:18:09,743) INFO - qlib.workflow - [recorder.py:345] - Recorder 024327ca3a6142a682481f8019db2e25 starts running under Experiment 429352785627166390 ...
+ModuleNotFoundError. CatBoostModel are skipped. (optional: maybe installing CatBoostModel can fix it.)
+ModuleNotFoundError. XGBModel is skipped(optional: maybe installing xgboost can fix it).
+ModuleNotFoundError.  PyTorch models are skipped (optional: maybe installing pytorch can fix it).
+[156:MainThread](2026-04-03 16:20:07,650) INFO - qlib.timer - [log.py:127] - Time cost: 117.164s | Loading data Done
+[156:MainThread](2026-04-03 16:20:07,858) INFO - qlib.timer - [log.py:127] - Time cost: 0.092s | DropnaLabel Done
+[156:MainThread](2026-04-03 16:20:09,630) INFO - qlib.timer - [log.py:127] - Time cost: 1.771s | CSZScoreNorm Done
+[156:MainThread](2026-04-03 16:20:09,632) INFO - qlib.timer - [log.py:127] - Time cost: 1.980s | fit & process data Done
+[156:MainThread](2026-04-03 16:20:09,633) INFO - qlib.timer - [log.py:127] - Time cost: 119.147s | Init data Done
+Training until validation scores don't improve for 50 rounds
+[20]	train's l2: 0.980444	valid's l2: 0.992439
+[40]	train's l2: 0.968638	valid's l2: 0.991752
+[60]	train's l2: 0.95932	valid's l2: 0.991561
+[80]	train's l2: 0.950794	valid's l2: 0.991773
+[100]	train's l2: 0.942906	valid's l2: 0.992198
+Early stopping, best iteration is:
+[58]	train's l2: 0.960066	valid's l2: 0.991519
+[156:MainThread](2026-04-03 16:20:41,338) INFO - qlib.fill_placeholder - [__init__.py:798] - <PRED> lookes like a placeholder, but it can't match to any given values
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+'The following are prediction results of the LGBModel model.'
+[156:MainThread](2026-04-03 16:20:41,496) INFO - qlib.workflow - [record_temp.py:197] - Signal record 'pred.pkl' has been saved as the artifact of the Experiment 429352785627166390
+                          score
+datetime   instrument          
+2013-01-11 SH600000    0.023873
+           SH600005    0.048163
+           SH600009   -0.003902
+           SH600010    0.055186
+           SH600011    0.092297
+Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]
+Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]Downloading artifacts: 100%|██████████| 1/1 [00:00<00:00, 613.11it/s]Downloading artifacts: 100%|██████████| 1/1 [00:00<00:00, 453.49it/s]
+Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]
+Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]Downloading artifacts: 100%|██████████| 1/1 [00:00<00:00, 932.69it/s]Downloading artifacts: 100%|██████████| 1/1 [00:00<00:00, 710.30it/s]
+{'IC': np.float64(-0.0003000213649448057),
+ 'ICIR': np.float64(-0.002005696895581701),
+ 'Rank IC': np.float64(0.022869263990627647),
+ 'Rank ICIR': np.float64(0.16595349772152146)}
+Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]
+Downloading artifacts:   0%|          | 0/1 [00:00<?, ?it/s]Downloading artifacts: 100%|██████████| 1/1 [00:00<00:00, 612.13it/s]Downloading artifacts: 100%|██████████| 1/1 [00:00<00:00, 521.23it/s]
+[156:MainThread](2026-04-03 16:20:42,451) INFO - qlib.backtest caller - [__init__.py:93] - Create new exchange
+[156:MainThread](2026-04-03 16:21:25,105) WARNING - qlib.online operator - [exchange.py:219] - $close field data contains nan.
+[156:MainThread](2026-04-03 16:21:25,107) WARNING - qlib.online operator - [exchange.py:219] - $close field data contains nan.
+[156:MainThread](2026-04-03 16:21:27,505) WARNING - qlib.BaseExecutor - [executor.py:121] - `common_infra` is not set for <qlib.backtest.executor.SimulatorExecutor object at 0x7f5c359d31f0>
+backtest loop:   0%|          | 0/6 [00:00<?, ?it/s]/usr/local/lib/python3.10/site-packages/qlib/utils/index_data.py:492: RuntimeWarning: Mean of empty slice
+  return np.nanmean(self.data)
+backtest loop: 100%|██████████| 6/6 [00:00<00:00, 58.98it/s]backtest loop: 100%|██████████| 6/6 [00:00<00:00, 58.82it/s]
+'The following are analysis results of benchmark return(1day).'
+[156:MainThread](2026-04-03 16:21:27,629) INFO - qlib.workflow - [record_temp.py:520] - Portfolio analysis record 'port_analysis_1day.pkl' has been saved as the artifact of the Experiment 429352785627166390
+                       risk
+mean               0.004405
+std                0.020747
+annualized_return  1.048343
+information_ratio  3.275393
+max_drawdown      -0.016672
+'The following are analysis results of the excess return without cost(1day).'
+                       risk
+mean              -0.003017
+std                0.018971
+annualized_return -0.718006
+information_ratio -2.453258
+max_drawdown      -0.038055
+'The following are analysis results of the excess return with cost(1day).'
+                       risk
+mean              -0.003225
+std                0.019114
+annualized_return -0.767628
+information_ratio -2.603164
+max_drawdown      -0.038520
+'The following are analysis results of indicators(1day).'
+[156:MainThread](2026-04-03 16:21:27,649) INFO - qlib.workflow - [record_temp.py:545] - Indicator analysis record 'indicator_analysis_1day.pkl' has been saved as the artifact of the Experiment 429352785627166390
+     value
+ffr    1.0
+pa     0.0
+pos    0.0
+[156:MainThread](2026-04-03 16:21:27,874) INFO - qlib.timer - [log.py:127] - Time cost: 0.176s | waiting `async_log` Done
+#### Do not import qlib package in the repository directory in case of importing qlib from . without compiling #####
+pred.pkl loaded, shape=(1800, 1), index levels=2
+⚠ analysis_position 不可用，跳过图表生成: No module named 'qlib.data._libs.rolling'
+✓ 详细图表已保存: /work/DATA/analysis_outputs/test_stage2_weekly_smoke2/model_predict/walk_forward/2013-01-11/model_predict/overview.html
+✓ 得分表已保存: /work/DATA/analysis_outputs/test_stage2_weekly_smoke2/model_predict/walk_forward/2013-01-11/model_predict/scores.csv  (300 行)
+✓ 指标表已保存: /work/DATA/analysis_outputs/test_stage2_weekly_smoke2/model_predict/walk_forward/2013-01-11/model_predict/metrics.csv
+
+═══ 绩效摘要 ═══
+  IC_mean                  : -0.0003
+  IC_std                   : 0.1496
+  ICIR                     : -0.0020
+  rank_IC_mean             : 0.0229
+  annualized_return        : -0.7676
+  max_drawdown             : -0.0385
+  monthly_win_rate         : 1.0000
+  sharpe_ratio             : -2.6786
+  information_ratio        : -2.6032
+  excess_return_with_cost_mean: -0.0032
+  excess_return_without_cost_mean: -0.0030
+  ffr                      : 1.0000
+  pa                       : 0.0000
+  pos                      : 0.0000
+  score_mean               : 0.0312
+  score_std                : 0.0834
+  score_spread_top_bottom  : 0.3580
+
+◆ Top10 预测得分:
+instrument    score  rank rank_pct quantile_bucket
+  SH601336 0.208633     1    0.33%        top_1pct
+  SH600837 0.173898     2    0.67%        top_1pct
+  SH600516 0.171272     3     1.0%        top_1pct
+  SH601233 0.170048     4    1.33%        top_5pct
+  SH601688 0.169692     5    1.67%        top_5pct
+  SH600999 0.166971     6     2.0%        top_5pct
+  SH600169 0.163060     7    2.33%        top_5pct
+  SH600109 0.162097     8    2.67%        top_5pct
+  SH600859 0.161850     9     3.0%        top_5pct
+  SZ000562 0.160048    10    3.33%        top_5pct
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[1:MainThread](2026-04-03 16:21:37,671) INFO - qlib.Initialization - [config.py:453] - default_conf: client.
+[1:MainThread](2026-04-03 16:21:37,680) INFO - qlib.Initialization - [__init__.py:82] - qlib successfully initialized based on client settings.
+[1:MainThread](2026-04-03 16:21:37,681) INFO - qlib.Initialization - [__init__.py:84] - data_path={'__DEFAULT_FREQ': PosixPath('/root/.qlib/qlib_data/cn_data')}
+[1:MainThread](2026-04-03 16:21:37,749) WARNING - qlib.BaseExecutor - [executor.py:121] - `common_infra` is not set for <qlib.backtest.executor.SimulatorExecutor object at 0x7fd016df6890>
+[1:MainThread](2026-04-03 16:21:37,765) INFO - qlib.backtest caller - [__init__.py:93] - Create new exchange
+[1:MainThread](2026-04-03 16:22:18,273) WARNING - qlib.online operator - [exchange.py:219] - $close field data contains nan.
+[1:MainThread](2026-04-03 16:22:18,275) WARNING - qlib.online operator - [exchange.py:219] - $close field data contains nan.
+backtest loop:   0%|          | 0/11 [00:00<?, ?it/s]/usr/local/lib/python3.10/site-packages/qlib/utils/index_data.py:492: RuntimeWarning: Mean of empty slice
+  return np.nanmean(self.data)
+/usr/local/lib/python3.10/site-packages/qlib/utils/index_data.py:492: RuntimeWarning: Mean of empty slice
+  return np.nanmean(self.data)
+/usr/local/lib/python3.10/site-packages/qlib/utils/index_data.py:492: RuntimeWarning: Mean of empty slice
+  return np.nanmean(self.data)
+backtest loop: 100%|██████████| 11/11 [00:00<00:00, 230.16it/s]
+✓ Full-cycle backtest report: /work/DATA/analysis_outputs/test_stage2_weekly_smoke2/report_of_backtest.txt
+✓ Full-cycle overview: /work/DATA/analysis_outputs/test_stage2_weekly_smoke2/model_predict/full_backtest/overview.html
+✓ Full-cycle daily report: /work/DATA/analysis_outputs/test_stage2_weekly_smoke2/model_predict/full_backtest/report_normal.csv
+✓ Full-cycle equity curve: /work/DATA/analysis_outputs/test_stage2_weekly_smoke2/model_predict/full_backtest/equity_curve.csv
+✓ Full-cycle signal: /work/DATA/analysis_outputs/test_stage2_weekly_smoke2/model_predict/full_backtest/signal.csv
+
+═══════════════════════════════════════════════
+Latest fold copied to root output: 2013-01-11
+Walk-forward fold summary: /work/DATA/analysis_outputs/test_stage2_weekly_smoke2/model_predict/walk_forward_folds.csv
+Walk-forward aggregate summary: /work/DATA/analysis_outputs/test_stage2_weekly_smoke2/model_predict/walk_forward_summary.csv
+Full-cycle backtest report: /work/DATA/analysis_outputs/test_stage2_weekly_smoke2/report_of_backtest.txt
+═══════════════════════════════════════════════
+[2/3] 读取 walk-forward 汇总
+﻿metric,mean,std,min,max,last
+IC_mean,0.037642895289827255,0.053659387329170624,-0.0003000213649448,0.0755858119445993,-0.0003000213649448
+IC_std,0.1608791904626709,0.01597296505997188,0.149584598553109,0.1721737823722328,0.149584598553109
+ICIR,0.2185015700042177,0.31184436745152017,-0.0020056968955817,0.4390088369040171,-0.0020056968955817
+rank_IC_mean,0.06851683490480945,0.0645554138762236,0.0228692639906276,0.1141644058189913,0.0228692639906276
+annualized_return,0.11550857322855379,1.2489434283613947,-0.7676277942841634,0.998644940741271,-0.7676277942841634
+max_drawdown,-0.0217864575886851,0.02366549878834532,-0.0385204922620861,-0.0050524229152841,-0.0385204922620861
+monthly_win_rate,1.0,0.0,1.0,1.0,1.0
+sharpe_ratio,2.306672091267001,7.050286389474989,-2.678633224037984,7.291977406571986,-2.678633224037984
+information_ratio,2.241682333560015,6.851646796985203,-2.6031635788833096,7.08652824600334,-2.6031635788833096
+excess_return_with_cost_mean,0.0004853301396158,0.005247661463703262,-0.0032253268667401,0.0041959871459717,-0.0032253268667401
+excess_return_without_cost_mean,0.0006971866855856998,0.005252416936981084,-0.0030168329481727,0.0044112063193441,-0.0030168329481727
+ffr,1.0,0.0,1.0,1.0,1.0
+pa,0.0,0.0,0.0,0.0,0.0
+pos,0.0,0.0,0.0,0.0,0.0
+score_mean,-0.003972163219661899,0.049702077707499875,-0.0391168394056958,0.031172512966372,0.031172512966372
+score_std,0.0803619304583649,0.004289672007014706,0.0773286742931387,0.0833951866235911,0.0833951866235911
+score_spread_top_bottom,0.34300385347901596,0.021238424604422754,0.3279860194195094,0.3580216875385225,0.3580216875385225
+[3/3] Stage2 完成 — 最新折叠结果保存在: /Users/apple/gitee/qlib/DATA/analysis_outputs/test_stage2_weekly_smoke2/model_predict
+
+============================================================
+  全部阶段执行完毕
+  输出目录: /Users/apple/gitee/qlib/DATA/analysis_outputs/test_stage2_weekly_smoke2
+============================================================

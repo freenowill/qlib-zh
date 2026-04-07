@@ -5,7 +5,7 @@ stage6_final_result.py
   1. 从 second_screen 读取已选股票
   2. 从 model_predict/scores.csv 查找最新排名，新增"最新排名"列
   3. 保存 result.csv
-  4. 若有股票最新排名在后30%，则用 second_screen 里排名更高的股票替换
+    4. 若有股票最新排名跌入后50%，则用 second_screen 里排名更高的股票替换
   5. 保存 result_update.csv
 输出:
   <output>/result.csv
@@ -15,32 +15,124 @@ import argparse
 import warnings
 from pathlib import Path
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 warnings.filterwarnings("ignore")
 
 
+def _normalize_code(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.replace(r"^[A-Za-z]+", "", regex=True).str.zfill(6)
+
+
+def _load_csv(path: Path, label: str) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"{label} 不存在: {path}")
+    return pd.read_csv(
+        path,
+        dtype={
+            "code": str,
+            "name": str,
+            "instrument": str,
+            "symbol": str,
+            "pred_date": str,
+            "listed_date": str,
+            "ipo_date": str,
+        },
+    )
+
+
+def _attach_latest_rank(df: pd.DataFrame, scores_df: pd.DataFrame) -> pd.DataFrame:
+    latest_cols = [c for c in ["code", "stock", "date", "percentile", "latest_rank_idx", "latest_rank_pct", "latest_score"] if c in scores_df.columns]
+    merged = df.merge(scores_df[latest_cols], on="code", how="left")
+    if "name" in merged.columns:
+        merged["name"] = merged["name"].fillna(merged["code"]).astype(str).str.zfill(6)
+    merged["最新排名"] = merged["latest_rank_idx"]
+    merged["最新排名_pct"] = merged["latest_rank_pct"]
+    if "stock" not in merged.columns:
+        merged["stock"] = merged["code"]
+    merged["current_holding"] = True
+    if "score" not in merged.columns:
+        merged["score"] = merged["latest_score"]
+    merged = merged.drop(columns=[c for c in ["latest_rank_idx", "latest_rank_pct", "latest_score"] if c in merged.columns])
+    return merged
+
+
+def _apply_portfolio_weights(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "volatility_60d" in out.columns:
+        vol = pd.to_numeric(out["volatility_60d"], errors="coerce")
+        inv_vol = 1.0 / vol.replace(0, np.nan)
+        inv_vol = inv_vol.replace([np.inf, -np.inf], np.nan)
+        if inv_vol.notna().sum() > 0:
+            inv_vol = inv_vol.fillna(inv_vol.dropna().median() if inv_vol.notna().any() else 1.0)
+            out["risk_parity_weight"] = inv_vol / inv_vol.sum()
+            out["weight"] = out["risk_parity_weight"]
+            return out
+
+    base = pd.to_numeric(out.get("weight"), errors="coerce")
+    if base.notna().sum() == 0:
+        out["weight"] = 1.0 / max(len(out), 1)
+    else:
+        base = base.fillna(0.0)
+        if base.sum() <= 0:
+            out["weight"] = 1.0 / max(len(out), 1)
+        else:
+            out["weight"] = base / base.sum()
+    out["risk_parity_weight"] = out.get("risk_parity_weight", out["weight"])
+    return out
+
+
+def _resolve_scores_csv(pred_dir: str) -> Path:
+    pred_path = Path(pred_dir)
+    scores_csv = pred_path / "scores.csv"
+    if scores_csv.exists():
+        return scores_csv
+    candidates = sorted(pred_path.glob("walk_forward/*/model_predict/scores.csv"))
+    if candidates:
+        return candidates[-1]
+    raise FileNotFoundError(f"scores.csv 不存在: {scores_csv}")
+
+
 def final_result(second_screen_csv: str, pred_dir: str,
                  output_dir: str, hold_num: int = 5,
-                 bottom_pct: float = 0.30):
+                 bottom_pct: float = 0.50):
+    if not (0 < bottom_pct < 1):
+        raise ValueError("bottom_pct must be in (0, 1)")
+
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
     # ── 1. 加载二筛结果 ───────────────────────────
-    ss_df = pd.read_csv(second_screen_csv)
+    ss_path = Path(second_screen_csv)
+    ss_df = _load_csv(ss_path, "second_screen.csv")
     if "code" not in ss_df.columns and "instrument" in ss_df.columns:
-        ss_df["code"] = ss_df["instrument"].astype(str).str.replace(r'^[A-Za-z]+', '', regex=True).str.zfill(6)
+        ss_df["code"] = _normalize_code(ss_df["instrument"])
+    ss_df["code"] = _normalize_code(ss_df["code"])
+    if "stock" not in ss_df.columns:
+        ss_df["stock"] = ss_df["code"]
     print(f"✓ 加载二筛结果: {len(ss_df)} 只股票")
     print(ss_df[["code"] + [c for c in ["name", "score", "rank_pct"] if c in ss_df.columns]].to_string(index=False))
 
+    candidates_path = ss_path.with_name("second_screen_candidates.csv")
+    if candidates_path.exists():
+        candidate_df = _load_csv(candidates_path, "second_screen_candidates.csv")
+        print(f"✓ 加载二筛完整候选池: {len(candidate_df)} 只股票")
+    else:
+        candidate_df = ss_df.copy()
+        print("  ⚠ 未找到 second_screen_candidates.csv，回退为仅使用当前持仓候选")
+    if "code" not in candidate_df.columns and "instrument" in candidate_df.columns:
+        candidate_df["code"] = _normalize_code(candidate_df["instrument"])
+    candidate_df["code"] = _normalize_code(candidate_df["code"])
+    if "stock" not in candidate_df.columns:
+        candidate_df["stock"] = candidate_df["code"]
+
     # ── 2. 从 scores.csv 获取最新排名 ─────────────
-    scores_csv = Path(pred_dir) / "scores.csv"
-    if not scores_csv.exists():
-        raise FileNotFoundError(f"scores.csv 不存在: {scores_csv}")
-    scores_df = pd.read_csv(scores_csv)
+    scores_csv = _resolve_scores_csv(pred_dir)
+    scores_df = _load_csv(scores_csv, "scores.csv")
     if "code" not in scores_df.columns and "instrument" in scores_df.columns:
-        scores_df["code"] = scores_df["instrument"].astype(str).str.replace(r'^[A-Za-z]+', '', regex=True).str.zfill(6)
+        scores_df["code"] = _normalize_code(scores_df["instrument"])
+    scores_df["code"] = _normalize_code(scores_df["code"])
 
     total_stocks = len(scores_df)
 
@@ -50,101 +142,81 @@ def final_result(second_screen_csv: str, pred_dir: str,
     scores_df["latest_rank_pct"] = (
         (scores_df["latest_rank_idx"] / total_stocks * 100).round(2).astype(str) + "%"
     )
-    latest_map = scores_df.set_index("code")[["latest_rank_idx", "latest_rank_pct"]].to_dict("index")
+    scores_df["latest_score"] = pd.to_numeric(scores_df["score"], errors="coerce")
 
     # ── 3. 拼接最新排名到二筛结果 ─────────────────
-    def _get_latest_rank(code):
-        return latest_map.get(str(code), {}).get("latest_rank_idx", np.nan)
-
-    def _get_latest_rank_pct(code):
-        return latest_map.get(str(code), {}).get("latest_rank_pct", "N/A")
-
-    result = ss_df.copy()
-    result["最新排名"]     = result["code"].apply(_get_latest_rank)
-    result["最新排名_pct"] = result["code"].apply(_get_latest_rank_pct)
+    result = _attach_latest_rank(ss_df.copy(), scores_df)
+    candidate_df = _attach_latest_rank(candidate_df.copy(), scores_df)
+    result = _apply_portfolio_weights(result)
+    candidate_df = _apply_portfolio_weights(candidate_df)
+    result["是否需要替换"] = False
 
     # ── 4. 保存 result.csv ────────────────────────
     result_csv = out_path / "result.csv"
-    result_scv = out_path / "result.scv"
     result.to_csv(result_csv, index=False, encoding="utf-8-sig")
-    result.to_csv(result_scv, index=False, encoding="utf-8-sig")
 
     print(f"\n◆ result.csv 内容:")
-    disp_cols = ["code"] + [c for c in ["name", "score", "rank_pct",
+    disp_cols = ["code"] + [c for c in ["name", "score", "weight", "rank_pct",
                                         "最新排名", "最新排名_pct",
                                         "valuation_label", "risk_label",
                                         "annualized_return", "max_drawdown",
                                         "sharpe_ratio", "ICIR", "monthly_win_rate"] if c in result.columns]
     print(result[disp_cols].to_string(index=False))
     print(f"\n✓ result.csv 保存: {result_csv}")
-    print(f"✓ result.scv 保存: {result_scv}")
 
-    # ── 5. 判断是否需要替换（最新排名在后30%）────────
-    threshold_rank = int(total_stocks * (1 - bottom_pct))  # rank > threshold → 后30%
+    # ── 5. 判断是否需要替换（最新排名在后50%）────────
+    threshold_rank = int(total_stocks * (1 - bottom_pct))  # rank > threshold → 后50%
     print(f"\n─── 调仓检查（后{int(bottom_pct*100)}% 阈值 = rank > {threshold_rank} / {total_stocks}）───")
 
     to_replace_codes = result[result["最新排名"] > threshold_rank]["code"].tolist()
+    result.loc[result["code"].isin(to_replace_codes), "是否需要替换"] = True
 
     if not to_replace_codes:
-        print("  ✓ 无需调仓，所有持仓股票最新排名均未进入后30%")
+        print("  ✓ 无需调仓，所有持仓股票最新排名均未进入后50%")
         result_update = result.copy()
         result_update["调仓说明"] = "持仓不变"
     else:
-        print(f"  ⚠ 以下股票最新排名进入后30%，需替换: {to_replace_codes}")
-
-        # 从 second_screen 的完整候选池中找替补
-        # second_screen 可能只有 hold_num 只 → 去 scores.csv 找初筛里
-        # 原始候选按 rank 排序，跳过已持仓
-        already_hold  = set(result["code"].tolist())
-        candidates    = scores_df[~scores_df["code"].isin(already_hold)].copy()
-
-        # 尝试过滤风险/估值（如果 risk_eval 数据可用）
-        risk_eval_csv = Path(second_screen_csv).parent.parent / "risk_eval" / "risk_eval.csv"
-        if risk_eval_csv.exists():
-            re_df = pd.read_csv(risk_eval_csv)
-            if "code" not in re_df.columns and "instrument" in re_df.columns:
-                re_df["code"] = re_df["instrument"].astype(str).str.replace(r'^[A-Za-z]+', '', regex=True).str.zfill(6)
-            # 稳健地检查列是否存在，避免 .get() 返回标量
-            risk_ok = (
-                re_df["risk_label"] != "高风险"
-                if "risk_label" in re_df.columns
-                else pd.Series(True, index=re_df.index)
-            )
-            val_ok = (
-                re_df["valuation_label"] != "高估值"
-                if "valuation_label" in re_df.columns
-                else pd.Series(True, index=re_df.index)
-            )
-            safe_codes = set(re_df[risk_ok & val_ok]["code"].tolist())
-            candidates_filtered = candidates[candidates["code"].isin(safe_codes)]
-            if not candidates_filtered.empty:
-                candidates = candidates_filtered
-
-        replacements      = candidates.head(len(to_replace_codes))
-        replacement_codes = replacements["code"].tolist()
+        print(f"  ⚠ 以下股票最新排名进入后50%，需替换: {to_replace_codes}")
+        already_hold = set(result["code"].tolist())
+        candidates = candidate_df[~candidate_df["code"].isin(already_hold)].copy()
+        candidates = candidates.sort_values(["最新排名", "score"], ascending=[True, False], na_position="last").reset_index(drop=True)
 
         result_update = result.copy()
         result_update["调仓说明"] = ""
+        result_update["是否需要替换"] = result_update["code"].isin(to_replace_codes)
+        result_update["当前持仓"] = result_update["code"]
 
-        for old_code, new_code in zip(to_replace_codes, replacement_codes):
+        for old_code in to_replace_codes:
             old_rank_pct = result_update.loc[result_update["code"] == old_code, "最新排名_pct"].values[0]
-            new_row_data = scores_df[scores_df["code"] == new_code].iloc[0].to_dict()
+            if candidates.empty:
+                idx = result_update[result_update["code"] == old_code].index[0]
+                result_update.at[idx, "调仓说明"] = f"保留{old_code}：候选池中无可替代标的"
+                print(f"  ⚠ 保留 {old_code}：候选池中无可替代标的")
+                continue
+
+            new_row = candidates.iloc[0].copy()
+            candidates = candidates.iloc[1:].reset_index(drop=True)
+            new_code = new_row["code"]
 
             # 替换行
             idx = result_update[result_update["code"] == old_code].index[0]
-            result_update.at[idx, "code"]          = new_code
-            result_update.at[idx, "score"]         = new_row_data.get("score",  np.nan)
-            result_update.at[idx, "rank"]           = new_row_data.get("latest_rank_idx", np.nan)
-            result_update.at[idx, "rank_pct"]       = new_row_data.get("latest_rank_pct", "N/A")
-            result_update.at[idx, "最新排名"]        = new_row_data.get("latest_rank_idx", np.nan)
-            result_update.at[idx, "最新排名_pct"]    = new_row_data.get("latest_rank_pct", "N/A")
-            result_update.at[idx, "调仓说明"]        = (
+            for col in result_update.columns:
+                if col == "调仓说明":
+                    continue
+                if col in new_row.index:
+                    result_update.at[idx, col] = new_row[col]
+            result_update.at[idx, "当前持仓"] = old_code
+            result_update.at[idx, "是否需要替换"] = True
+            result_update.at[idx, "调仓说明"] = (
                 f"卖出{old_code}(最新排名{old_rank_pct})→买入{new_code}"
             )
             print(f"  替换: 卖出 {old_code}（最新排名 {old_rank_pct}）→ 买入 {new_code}")
 
         # 未替换的行填充说明
         result_update.loc[result_update["调仓说明"] == "", "调仓说明"] = "继续持有"
+    if "当前持仓" not in result_update.columns:
+        result_update["当前持仓"] = result_update["code"]
+    result_update = _apply_portfolio_weights(result_update)
 
     # ── 6. 保存 result_update.csv ─────────────────
     result_update_csv = out_path / "result_update.csv"
@@ -152,8 +224,9 @@ def final_result(second_screen_csv: str, pred_dir: str,
 
     print(f"\n◆ result_update.csv 内容:")
     disp_cols2 = ["code"] + [c for c in ["name", "score", "rank_pct",
+                                          "percentile", "weight", "当前持仓",
                                           "最新排名", "最新排名_pct",
-                                          "valuation_label", "risk_label",
+                                          "valuation_label", "risk_label", "是否需要替换",
                                           "调仓说明"] if c in result_update.columns]
     print(result_update[disp_cols2].to_string(index=False))
     print(f"\n✓ result_update.csv 保存: {result_update_csv}")
@@ -191,7 +264,7 @@ def main():
     ap.add_argument("--pred-dir",      required=True, dest="pred_dir")
     ap.add_argument("--output",        required=True)
     ap.add_argument("--hold-num",      type=int,   default=5,    dest="hold_num")
-    ap.add_argument("--bottom-pct",    type=float, default=0.30, dest="bottom_pct")
+    ap.add_argument("--bottom-pct",    type=float, default=0.50, dest="bottom_pct")
     args = ap.parse_args()
     final_result(args.second_screen, args.pred_dir, args.output,
                  args.hold_num, args.bottom_pct)
