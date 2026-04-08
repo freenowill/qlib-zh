@@ -45,10 +45,10 @@ PRACTICE_SCRIPTS="$SCRIPT_DIR/scripts/practice"
 export QLIB_DATA_DIR="$QDATA_HOST_DIR/qlib_data/cn_data_filter"
 
 # 实盘账户参数（供子脚本读取）
-export CASH_TOTAL=20000   # 5 positions × ¥4,000 each
+export CASH_TOTAL=100000  # 10 positions × ¥10,000 each
 export TX_FEE_RATE=0.0001        # 万分之一
 export STAMP_DUTY_RATE=0.0005    # 万分之五
-export HOLD_NUM=5                 # 始终持有5支
+export HOLD_NUM=10                # 始终持有10支
 PER_STOCK_BUDGET_RAW=$(( CASH_TOTAL / HOLD_NUM ))
 MAX_STOCK_PRICE=$(python3 - <<'PY'
 import math, os
