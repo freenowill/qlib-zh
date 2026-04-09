@@ -4,8 +4,6 @@
 
 ![量化选股流程](docs/quant_flow.png)
 
-注：图片文件位于 `docs/quant_flow.png`。如果仓库中尚无此图片，请将你提供的流程图保存为 `docs/quant_flow.png` 并提交到仓库，或告诉我我可以帮你把图片添加到该路径。
-
 本文档面向小白用户，覆盖：环境搭建（使用镜像 `zhuhai123/qlib-rdagent:v1`）、Qlib 数据获取、以及如何使用仓库内的 `run_alpha158_practice` 脚本顺序执行 stage1→stage6（并说明每个步骤做了什么与输出结果存放位置）。
 
 ---
@@ -49,8 +47,9 @@ docker run --rm -it \
 
 ```bash
 # 下载并解压到本地，然后确保路径为 $HOME/.qlib/qlib_data
-mkdir -p $HOME/.qlib
+mkdir -p ~/.qlib/qlib_data/cn_data
 # 将 release 中的 qlib 数据包解压到 $HOME/.qlib/qlib_data
+tar -zxvf qlib_bin.tar.gz -C ~/.qlib/qlib_data/cn_data --strip-components=1
 ```
 
 ---
