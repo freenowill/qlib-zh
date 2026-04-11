@@ -25,8 +25,11 @@ docker run --rm -it \
   -v "$PWD:/work" \
   -v "$HOME/.qlib:/root/.qlib" \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -e DOCKER_HOST=unix:///var/run/docker.sock \
   --env-file "$PWD/.env" \
+  -e DOCKER_HOST=unix:///var/run/docker.sock \
+  -e QLIB_DOCKER_BUILD_FROM_DOCKERFILE=false \
+  -e QLIB_DOCKER_IMAGE=local_qlib:latest \
+  -e CONDA_DEFAULT_ENV=qlib_env \
   -p 10086:10086 \
   -w /work \
   zhuhai123/qlib-rdagent:v1 \
