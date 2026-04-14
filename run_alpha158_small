@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# =============================================================================
+# run_alpha158_small — 周度实盘选股辅助脚本（中小盘/中证1000）
+# 用法: bash run_alpha158_small <experiment_name> [stage=N] [end_stage=N]
+# =============================================================================
+set -euo pipefail
+
+export TARGET_MARKET="${TARGET_MARKET:-csi1000}"
+export TARGET_BENCHMARK="${TARGET_BENCHMARK:-SH000852}"
+export WORKFLOW_TEMPLATE="${WORKFLOW_TEMPLATE:-/work/examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha158_small.yaml}"
+
+exec bash "$(dirname "$0")/run_alpha158_practice" "$@"

@@ -1,0 +1,11 @@
+fin_factor 成功执行命令（本地 stub + 复用现成数据 + 跳过下载）
+
+在仓库根目录 /Users/apple/gitee/qlib 执行：
+
+HOST_PWD="$(pwd)"; docker run --rm -e DOCKER_HOST=unix:///var/run/docker.sock -e PYTHONPATH="$HOST_PWD" -e OPENAI_API_KEY='086fd27dd6184f80bc04172021661edf.CPUClMiDSGqqVwpe' -e CHAT_MODEL='openai/glm-4.7' -e OPENAI_API_BASE='https://open.bigmodel.cn/api/paas/v4' -e RDAGENT_MAX_ROUNDS=1 -v "$HOST_PWD:$HOST_PWD" -v "$HOME/.qlib:/root/.qlib" -v /var/run/docker.sock:/var/run/docker.sock --env-file "$HOST_PWD/.env" -e QLIB_DOCKER_BUILD_FROM_DOCKERFILE=false -e QLIB_DOCKER_IMAGE=local_qlib:latest -e CONDA_DEFAULT_ENV=qlib_env -w "$HOST_PWD" zhuhai123/qlib-rdagent:v1 rdagent fin_factor --step-n 1 --loop-n 1
+
+说明：
+- `PYTHONPATH=$HOST_PWD` 用于让仓库根目录下的 `sitecustomize.py` 生效。
+- `FORCE_LOCAL_STUB=1` 用于绕过远程模型鉴权失败。
+- `RDAGENT_MAX_ROUNDS=1` 只跑 1 轮，方便快速验证。
+- `.env` 里已配置 `QLIB_DOCKER_IMAGE=local_qlib:latest` 与 `QLIB_DOCKER_EXTRA_VOLUMES`。

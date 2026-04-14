@@ -43,6 +43,9 @@ WORKDIR_IN_CONTAINER="/work"
 OUT_DIR_IN_CONTAINER="$WORKDIR_IN_CONTAINER/DATA/analysis_outputs/$EXP_NAME"
 PRACTICE_SCRIPTS="$SCRIPT_DIR/scripts/practice"
 export QLIB_DATA_DIR="$QDATA_HOST_DIR/qlib_data/cn_data_filter"
+export TARGET_MARKET="${TARGET_MARKET:-csi300}"
+export TARGET_BENCHMARK="${TARGET_BENCHMARK:-SH000300}"
+export WORKFLOW_TEMPLATE="${WORKFLOW_TEMPLATE:-$WORKDIR_IN_CONTAINER/examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha158.yaml}"
 
 # 实盘账户参数（供子脚本读取）
 export CASH_TOTAL=100000  # 10 positions × ¥10,000 each
@@ -172,6 +175,8 @@ mkdir -p "$OUT_DIR/final_result"
 echo "============================================================"
 echo "  run_alpha158_practice"
 echo "  experiment : $EXP_NAME"
+echo "  market     : $TARGET_MARKET"
+echo "  benchmark  : $TARGET_BENCHMARK"
 echo "  T (本周五) : $T"
 if [[ -n "$DATA_LATEST_DATE" ]]; then
   echo "  数据最新日 : $DATA_LATEST_DATE"
@@ -223,6 +228,7 @@ run_stage1() {
     echo "[2/2] 检查数据健康状态"
     docker run --rm \
       -e PRED_DATE \
+      -e TARGET_MARKET \
       -v "$SCRIPT_DIR:$WORKDIR_IN_CONTAINER" \
       -v "$QDATA_HOST_DIR:/root/.qlib" \
       -w "$WORKDIR_IN_CONTAINER" \
@@ -231,7 +237,8 @@ run_stage1() {
       --source-qlib-dir /root/.qlib/qlib_data/cn_data \
       --qlib-dir /root/.qlib/qlib_data/cn_data_filter \
       --output "$OUT_DIR_IN_CONTAINER/data_health" \
-      --pred-date "$PRED_DATE"
+      --pred-date "$PRED_DATE" \
+      --market "$TARGET_MARKET"
 
     echo "✓ Stage1 完成 — 数据健康检查通过"
   ) 2>&1 | tee "$log"
@@ -247,7 +254,7 @@ run_stage2() {
   (
     set -euo pipefail
 
-    local YAML_SRC="$WORKDIR_IN_CONTAINER/examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha158.yaml"
+    local YAML_SRC="$WORKFLOW_TEMPLATE"
     local PRED_OUT_HOST="$OUT_DIR/model_predict"
     local PRED_OUT_CONTAINER="$OUT_DIR_IN_CONTAINER/model_predict"
 
@@ -264,6 +271,7 @@ run_stage2() {
       -e TCN_EARLY_STOP \
       -e TCN_N_CHANS \
       -e TCN_NUM_LAYERS \
+      -e TARGET_MARKET \
       -e WALK_FORWARD_STEP_YEARS \
       -e WALK_FORWARD_STEP_WEEKS \
       -e WALK_FORWARD_TEST_YEARS \
@@ -330,7 +338,8 @@ run_stage3() {
         --output    "$OUT_DIR_IN_CONTAINER/first_screen" \
         --pred-date "$PRED_DATE" \
         --top-n     20 \
-        --max-price 50
+        --max-price 50 \
+        --market    "$TARGET_MARKET"
     echo "✓ Stage3 完成 — 初筛结果保存在: $OUT_DIR/first_screen"
   ) 2>&1 | tee "$log"
 }

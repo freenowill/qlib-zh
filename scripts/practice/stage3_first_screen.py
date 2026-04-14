@@ -2,7 +2,7 @@
 """
 stage3_first_screen.py
 初筛选股：
-  1. 从沪深300（CSI300）成分股中
+    1. 从目标指数（默认 CSI300，可通过 --market 改为 CSI500 等）成分股中
   2. 排除 ST、涨停/跌停、停牌、上市不足60天、日均成交额排名后20%
     3. 从初筛池中取模型得分最高的 top_n（默认20）支
 数据源：掘金量化 gm 免费数据
@@ -81,8 +81,8 @@ def _local_basic_info(codes: list[str]) -> pd.DataFrame:
     return out[["code", "sec_name", "listed_date", "symbol"]].drop_duplicates(subset=["code"])
 
 
-def _local_csi300_components(pred_date: str) -> set[str]:
-    path = _qlib_root() / "instruments" / "csi300.txt"
+def _local_market_components(market: str, pred_date: str) -> set[str]:
+    path = _qlib_root() / "instruments" / f"{market}.txt"
     if not path.exists():
         return set()
     df = pd.read_csv(path, sep="\t", header=None, names=["code", "listed_date", "delisted_date"])
@@ -166,23 +166,32 @@ def _get_basic_info(gm: GmClient | None, codes: list[str]) -> pd.DataFrame:
     return _local_basic_info(codes)
 
 
-def _get_csi300_components(gm: GmClient | None, pred_date: str) -> set[str]:
-    print("  [gm] 获取沪深300成分股...")
+def _get_market_components(gm: GmClient | None, market: str, pred_date: str) -> set[str]:
+    print(f"  [gm] 获取 {market.upper()} 成分股...")
     if gm is None:
-        print("  ⚠ 未提供 gm 客户端，切换到本地 Qlib csi300.txt")
-        return _local_csi300_components(pred_date)
+        print(f"  ⚠ 未提供 gm 客户端，切换到本地 Qlib {market}.txt")
+        return _local_market_components(market, pred_date)
     start_date = (pd.to_datetime(pred_date) - timedelta(days=90)).strftime("%Y-%m-%d")
+    index_code = {
+        "csi300": "SHSE.000300",
+        "csi500": "SHSE.000905",
+        "csi800": "SHSE.000906",
+        "csi1000": "SHSE.000852",
+    }.get(market.lower())
+    if index_code is None:
+        print(f"  ⚠ 未知 market={market}，回退到本地 Qlib {market}.txt")
+        return _local_market_components(market, pred_date)
     try:
-        df = gm.get_history_constituents(index="SHSE.000300", start_date=start_date, end_date=pred_date)
+        df = gm.get_history_constituents(index=index_code, start_date=start_date, end_date=pred_date)
     except Exception as exc:
         print(f"  ⚠ get_history_constituents 失败: {exc}")
-        return _local_csi300_components(pred_date)
+        return _local_market_components(market, pred_date)
     if df is None or df.empty:
-        print("  ⚠ gm 沪深300成分为空，切换到本地 Qlib csi300.txt")
-        return _local_csi300_components(pred_date)
+        print(f"  ⚠ gm {market.upper()} 成分为空，切换到本地 Qlib {market}.txt")
+        return _local_market_components(market, pred_date)
     code_col = next((c for c in df.columns if c.lower() in {"symbol", "code", "con_code"}), None)
     if code_col is None:
-        return _local_csi300_components(pred_date)
+        return _local_market_components(market, pred_date)
     return set(df[code_col].astype(str).map(_normalize_symbol))
 
 
@@ -316,7 +325,7 @@ def _avg_turnover(gm: GmClient | None, codes: set[str], pred_date: str, days: in
     return df.groupby("code")["amount"].apply(lambda s: float(s.dropna().tail(days).mean()) if not s.dropna().empty else 0.0).to_dict()
 
 
-def first_screen(pred_dir: str, output_dir: str, pred_date: str, top_n: int = 20, max_price: float = 50.0):
+def first_screen(pred_dir: str, output_dir: str, pred_date: str, top_n: int = 20, max_price: float = 50.0, market: str = "csi300"):
     gm = None
     gm_token = os.getenv("GM_TOKEN", "").strip()
     if gm_token:
@@ -339,12 +348,12 @@ def first_screen(pred_dir: str, output_dir: str, pred_date: str, top_n: int = 20
     print(f"✓ 模型得分加载完成，共 {len(scores_df)} 只股票")
 
     basic_df = _get_basic_info(gm, scores_df["code"].dropna().astype(str).tolist())
-    csi300 = _get_csi300_components(gm, pred_date)
-    if csi300:
-        pool = scores_df[scores_df["code"].isin(csi300)].copy()
-        print(f"✓ 沪深300筛选后剩余: {len(pool)} 只")
+    components = _get_market_components(gm, market, pred_date)
+    if components:
+        pool = scores_df[scores_df["code"].isin(components)].copy()
+        print(f"✓ {market.upper()} 筛选后剩余: {len(pool)} 只")
     else:
-        print("  ⚠ 沪深300成分获取失败，使用全部得分股票作为候选池")
+        print(f"  ⚠ {market.upper()} 成分获取失败，使用全部得分股票作为候选池")
         pool = scores_df.copy()
 
     pool = pool.merge(
@@ -417,8 +426,9 @@ def main():
     ap.add_argument("--pred-date", required=True, dest="pred_date")
     ap.add_argument("--top-n", type=int, default=20, dest="top_n")
     ap.add_argument("--max-price", type=float, default=0.0, dest="max_price")
+    ap.add_argument("--market", default=os.environ.get("TARGET_MARKET", "csi300"))
     args = ap.parse_args()
-    first_screen(args.pred_dir, args.output, args.pred_date, top_n=args.top_n, max_price=args.max_price)
+    first_screen(args.pred_dir, args.output, args.pred_date, top_n=args.top_n, max_price=args.max_price, market=args.market)
 
 
 if __name__ == "__main__":
