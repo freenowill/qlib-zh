@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from pandas.errors import EmptyDataError
 
 warnings.filterwarnings("ignore")
 
@@ -71,6 +72,16 @@ def _resolve_scores_csv(pred_dir: str) -> Path:
     if candidates:
         return candidates[-1]
     raise FileNotFoundError(f"scores.csv 不存在: {scores_csv}")
+
+
+def _read_csv_or_empty(path: str | Path) -> pd.DataFrame:
+    csv_path = Path(path)
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(csv_path)
+    except EmptyDataError:
+        return pd.DataFrame()
 
 
 _QLIB_INITED = False
@@ -186,11 +197,29 @@ def second_screen(risk_eval_csv: str, pred_dir: str,
     out_path.mkdir(parents=True, exist_ok=True)
 
     # ── 1. 加载风险评估结果 ───────────────────────
-    risk_df = pd.read_csv(risk_eval_csv)
+    risk_df = _read_csv_or_empty(risk_eval_csv)
+    if risk_df.empty:
+        print(f"⚠ 风险评估文件为空或不存在: {risk_eval_csv}，回退使用 scores.csv 作为候选池")
+        scores_csv = _resolve_scores_csv(pred_dir)
+        risk_df = _read_csv_or_empty(scores_csv)
+        if risk_df.empty:
+            print("⚠ scores.csv 也为空，输出空的二筛结果")
+            (out_path / "second_screen.csv").write_text("", encoding="utf-8")
+            (out_path / "second_screen_candidates.csv").write_text("", encoding="utf-8")
+            return
     if "code" not in risk_df.columns and "instrument" in risk_df.columns:
         risk_df["code"] = risk_df["instrument"]
     if "code" in risk_df.columns:
         risk_df["code"] = _normalize_code(risk_df["code"])
+    for col, default in {
+        "risk_label": "中",
+        "valuation_label": "中",
+        "financial_label": "中",
+        "is_st": False,
+        "is_suspended": False,
+    }.items():
+        if col not in risk_df.columns:
+            risk_df[col] = default
     print(f"✓ 加载 risk_eval: {len(risk_df)} 只股票")
 
     # ── 2. 先做硬约束：高风险 / ST / 停牌剔除 ──────
