@@ -352,6 +352,9 @@ def first_screen(pred_dir: str, output_dir: str, pred_date: str, top_n: int = 20
     if components:
         pool = scores_df[scores_df["code"].isin(components)].copy()
         print(f"✓ {market.upper()} 筛选后剩余: {len(pool)} 只")
+        if pool.empty:
+            print(f"  ⚠ {market.upper()} 成分与预测池无交集，回退为全部得分股票作为候选池")
+            pool = scores_df.copy()
     else:
         print(f"  ⚠ {market.upper()} 成分获取失败，使用全部得分股票作为候选池")
         pool = scores_df.copy()
@@ -367,41 +370,78 @@ def first_screen(pred_dir: str, output_dir: str, pred_date: str, top_n: int = 20
     pool = pool[~pool["code"].isin(st_set)]
     print(f"✓ 排除 ST 后剩余: {len(pool)} (移除 {before - len(pool)} 只)")
 
-    codes_now = set(pool["code"].tolist())
+    base_pool = pool.copy()
+    codes_now = set(base_pool["code"].tolist())
     realtime = _latest_quotes(gm, codes_now, pred_date, basic_df)
-    if not realtime.empty:
-        realtime_map = realtime.set_index("code").to_dict("index")
 
-        def _is_limit(code):
-            info = realtime_map.get(code, {})
-            pct = info.get("change_pct", 0) or 0
-            return abs(float(pct)) >= 9.5
+    def _screen(apply_limit: bool, apply_turnover: bool, apply_price_cap: bool) -> pd.DataFrame:
+        candidate = base_pool.copy()
 
-        def _is_suspended(code):
-            return bool(realtime_map.get(code, {}).get("is_suspended", False))
+        if not realtime.empty and apply_limit:
+            realtime_map = realtime.set_index("code").to_dict("index")
 
-        before = len(pool)
-        pool = pool[~pool["code"].apply(_is_limit)]
-        pool = pool[~pool["code"].apply(_is_suspended)]
-        print(f"✓ 排除涨跌停/停牌后剩余: {len(pool)} (移除 {before - len(pool)} 只)")
+            def _is_limit(code):
+                info = realtime_map.get(code, {})
+                pct = info.get("change_pct", 0) or 0
+                return abs(float(pct)) >= 9.5
 
-        before = len(pool)
-        turnover_map = _avg_turnover(gm, set(pool["code"].tolist()), pred_date)
-        pool["avg_turnover"] = pool["code"].map(turnover_map)
-        valid_turnover = pd.to_numeric(pool["avg_turnover"], errors="coerce").dropna()
-        if not valid_turnover.empty and (valid_turnover > 0).any():
-            q20 = valid_turnover.quantile(0.2)
-            pool = pool[pd.to_numeric(pool["avg_turnover"], errors="coerce").fillna(0) > q20]
-            print(f"✓ 排除成交额后20%后剩余: {len(pool)} (移除 {before - len(pool)} 只，阈值={q20:,.0f})")
+            def _is_suspended(code):
+                return bool(realtime_map.get(code, {}).get("is_suspended", False))
+
+            before_local = len(candidate)
+            candidate = candidate[~candidate["code"].apply(_is_limit)]
+            candidate = candidate[~candidate["code"].apply(_is_suspended)]
+            print(f"✓ 排除涨跌停/停牌后剩余: {len(candidate)} (移除 {before_local - len(candidate)} 只)")
+
+        if apply_turnover and not realtime.empty:
+            before_local = len(candidate)
+            turnover_map = _avg_turnover(gm, set(candidate["code"].tolist()), pred_date)
+            candidate["avg_turnover"] = candidate["code"].map(turnover_map)
+            valid_turnover = pd.to_numeric(candidate["avg_turnover"], errors="coerce").dropna()
+            if not valid_turnover.empty and (valid_turnover > 0).any():
+                q20 = valid_turnover.quantile(0.2)
+                candidate = candidate[pd.to_numeric(candidate["avg_turnover"], errors="coerce").fillna(0) > q20]
+                print(f"✓ 排除成交额后20%后剩余: {len(candidate)} (移除 {before_local - len(candidate)} 只，阈值={q20:,.0f})")
+            else:
+                print("  ⚠ 成交额数据不足，跳过后20%流动性过滤")
         else:
-            print("  ⚠ 成交额数据不足，跳过后20%流动性过滤")
-    else:
-        pool["avg_turnover"] = float("nan")
+            candidate["avg_turnover"] = float("nan")
 
-    pred_dt = pd.to_datetime(pred_date)
-    before = len(pool)
-    pool = pool[(pred_dt - pd.to_datetime(pool["listed_date"], errors="coerce")).dt.days.fillna(9999) >= 60]
-    print(f"✓ 排除上市不足60天后剩余: {len(pool)} (移除 {before - len(pool)} 只)")
+        if apply_price_cap and max_price > 0 and "price" in candidate.columns:
+            before_local = len(candidate)
+            price_num = pd.to_numeric(candidate["price"], errors="coerce")
+            candidate = candidate[price_num.notna() & (price_num <= max_price)].copy()
+            print(f"✓ 价格上限过滤(≤{max_price:g})后剩余: {len(candidate)} (移除 {before_local - len(candidate)} 只)")
+
+        pred_dt = pd.to_datetime(pred_date)
+        before_local = len(candidate)
+        candidate = candidate[(pred_dt - pd.to_datetime(candidate["listed_date"], errors="coerce")).dt.days.fillna(9999) >= 60]
+        print(f"✓ 排除上市不足60天后剩余: {len(candidate)} (移除 {before_local - len(candidate)} 只)")
+
+        return candidate
+
+    # 先走严格版；如果被过度过滤清空，则逐级放宽，但不会影响原本已经可用的结果。
+    attempts = [
+        (True, True, True),
+        (True, True, False),
+        (True, False, True),
+        (True, False, False),
+        (False, False, True),
+        (False, False, False),
+    ]
+    pool = pd.DataFrame()
+    for apply_limit, apply_turnover, apply_price_cap in attempts:
+        candidate = _screen(apply_limit, apply_turnover, apply_price_cap)
+        if not candidate.empty:
+            pool = candidate
+            break
+
+    if pool.empty:
+        print("  ⚠ 所有筛选尝试后仍为空，输出空表")
+        out_csv = out_path / "first_screen.csv"
+        pool.to_csv(out_csv, index=False, encoding="utf-8-sig")
+        print(f"\n✓ 初筛结果保存: {out_csv}")
+        return
 
     if "score_final" in pool.columns:
         score_col = "score_final"
