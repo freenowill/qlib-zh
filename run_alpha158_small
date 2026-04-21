@@ -1,12 +1,418 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run_alpha158_small — 周度实盘选股辅助脚本（中小盘/中证1000）
+# run_alpha158_small — 周度实盘选股辅助脚本（中证1000 / 小盘风格）
 # 用法: bash run_alpha158_small <experiment_name> [stage=N] [end_stage=N]
+# 示例: bash run_alpha158_small myexp_20260421 stage=1 end_stage=6
+#       STAGE2_MAX_FOLDS=1 bash run_alpha158_small myexp_20260421 stage=2 end_stage=6
 # =============================================================================
 set -euo pipefail
 
+# ──────────────────────────────────────────────
+# 0. 参数解析
+# ──────────────────────────────────────────────
+if [[ $# -lt 1 ]]; then
+	echo "Usage: bash run_alpha158_small <experiment_name> [stage=N] [end_stage=N]" >&2
+	echo "       N: 1-6 (default start=1  end=6)" >&2
+	exit 1
+fi
+
+EXP_NAME="$1"
+shift
+
+START_STAGE=1
+END_STAGE=6
+
+for arg in "$@"; do
+	case "$arg" in
+		stage=*)     START_STAGE="${arg#stage=}" ;;
+		end_stage=*) END_STAGE="${arg#end_stage=}" ;;
+		*) echo "Unknown argument: $arg" >&2; exit 1 ;;
+	esac
+done
+
+# ──────────────────────────────────────────────
+# 1. 全局路径 / 常量
+# ──────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUT_ROOT="$SCRIPT_DIR/DATA/analysis_outputs"
+OUT_DIR="$OUT_ROOT/$EXP_NAME"
+LOG_DIR="$OUT_DIR/logs"
+QDATA_HOST_DIR="${QLIB_HOST_DATA_DIR:-$HOME/.qlib}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-qlib-rdagent:v1}"
+WORKDIR_IN_CONTAINER="/work"
+OUT_DIR_IN_CONTAINER="$WORKDIR_IN_CONTAINER/DATA/analysis_outputs/$EXP_NAME"
+SMALL_SCRIPTS="$SCRIPT_DIR/scripts/small"
+export QLIB_DATA_DIR="$QDATA_HOST_DIR/qlib_data/cn_data_filter_small"
 export TARGET_MARKET="${TARGET_MARKET:-csi1000}"
 export TARGET_BENCHMARK="${TARGET_BENCHMARK:-SH000852}"
-export WORKFLOW_TEMPLATE="${WORKFLOW_TEMPLATE:-/work/examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha158_small.yaml}"
+export WORKFLOW_TEMPLATE="${WORKFLOW_TEMPLATE:-$WORKDIR_IN_CONTAINER/scripts/small/templates/workflow_config_lightgbm_Alpha158_csi1000.yaml}"
+export STAGE2_MAX_FOLDS="${STAGE2_MAX_FOLDS:-0}"
 
-exec bash "$(dirname "$0")/run_alpha158_practice" "$@"
+# 实盘账户参数（供子脚本读取）
+export CASH_TOTAL="${CASH_TOTAL:-100000}"
+export TX_FEE_RATE="${TX_FEE_RATE:-0.0001}"
+export STAMP_DUTY_RATE="${STAMP_DUTY_RATE:-0.0005}"
+export HOLD_NUM="${HOLD_NUM:-20}"
+PER_STOCK_BUDGET_RAW=$(( CASH_TOTAL / HOLD_NUM ))
+MAX_STOCK_PRICE=$(python3 - <<'PY'
+import math, os
+cash_total = float(os.environ.get("CASH_TOTAL", "100000"))
+hold_num = int(os.environ.get("HOLD_NUM", "20"))
+fee = float(os.environ.get("TX_FEE_RATE", "0.0001"))
+budget = cash_total / max(hold_num, 1)
+affordable = budget / (100 * (1 + fee))
+print(f"{math.floor(affordable * 100) / 100:.2f}")
+PY
+)
+export MAX_STOCK_PRICE
+export SAMPLE_WEIGHT_HALF_LIFE="${SAMPLE_WEIGHT_HALF_LIFE:-252}"
+export WALK_FORWARD_STEP_YEARS="${WALK_FORWARD_STEP_YEARS:-1}"
+export WALK_FORWARD_STEP_WEEKS="${WALK_FORWARD_STEP_WEEKS:-0}"
+export WALK_FORWARD_TEST_YEARS="${WALK_FORWARD_TEST_YEARS:-3}"
+export WALK_FORWARD_TEST_WEEKS="${WALK_FORWARD_TEST_WEEKS:-52}"
+export WALK_FORWARD_SEGMENT_YEARS="${WALK_FORWARD_SEGMENT_YEARS:-1}"
+export WALK_FORWARD_HISTORY_YEARS="${WALK_FORWARD_HISTORY_YEARS:-10}"
+export WALK_FORWARD_START_DATE="${WALK_FORWARD_START_DATE:-2015-01-01}"
+export WALK_FORWARD_END_DATE="${WALK_FORWARD_END_DATE:-}"
+export TRAIN_YEARS="${TRAIN_YEARS:-5}"
+export VALID_YEARS="${VALID_YEARS:-2}"
+
+# ──────────────────────────────────────────────
+# 2. 日期计算
+# ──────────────────────────────────────────────
+_date_offset() {
+	local base="$1"
+	local days="$2"
+	if date --version >/dev/null 2>&1; then
+		date -d "$base $days days" +%Y-%m-%d
+	else
+		local flag
+		if (( days >= 0 )); then
+			flag="+${days}d"
+		else
+			flag="${days}d"
+		fi
+		date -j -v"$flag" -f "%Y-%m-%d" "$base" +%Y-%m-%d
+	fi
+}
+
+_date_offset_years() {
+	local base="$1"
+	local years="$2"
+	if date --version >/dev/null 2>&1; then
+		date -d "$base $years years" +%Y-%m-%d
+	else
+		local flag
+		if (( years >= 0 )); then
+			flag="+${years}y"
+		else
+			flag="${years}y"
+		fi
+		date -j -v"$flag" -f "%Y-%m-%d" "$base" +%Y-%m-%d
+	fi
+}
+
+_this_friday() {
+	local today
+	today="$(date +%Y-%m-%d)"
+	local dow
+	dow="$(date +%u)"
+	local diff=$(( 5 - dow ))
+	if (( diff < 0 )); then diff=$(( diff + 7 )); fi
+	_date_offset "$today" "$diff"
+}
+
+T="$(_this_friday)"
+DATA_CALENDAR_FILE="$QDATA_HOST_DIR/qlib_data/cn_data/calendars/day.txt"
+DATA_LATEST_DATE=""
+if [[ -f "$DATA_CALENDAR_FILE" ]]; then
+	DATA_LATEST_DATE="$(tail -1 "$DATA_CALENDAR_FILE" | tr -d '\r')"
+fi
+
+TRAIN_BASE_START="2015-01-01"
+TARGET_TEST_END="$(_date_offset "$T" -1)"
+if [[ -n "$DATA_LATEST_DATE" && "$TARGET_TEST_END" > "$DATA_LATEST_DATE" ]]; then
+	TEST_END="$DATA_LATEST_DATE"
+else
+	TEST_END="$TARGET_TEST_END"
+fi
+TEST_START="$(_date_offset_years "$TEST_END" -3)"
+VALID_END="$(_date_offset "$TEST_START" -1)"
+VALID_START="$(_date_offset_years "$VALID_END" -2)"
+TRAIN_END="$(_date_offset "$VALID_START" -1)"
+TRAIN_START_RAW="$(_date_offset_years "$TRAIN_END" -5)"
+if [[ "$TRAIN_START_RAW" < "$TRAIN_BASE_START" ]]; then
+	TRAIN_START="$TRAIN_BASE_START"
+else
+	TRAIN_START="$TRAIN_START_RAW"
+fi
+PRED_DATE="$TEST_END"
+
+export T TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END PRED_DATE
+export WALK_FORWARD_END_DATE="${WALK_FORWARD_END_DATE:-$PRED_DATE}"
+export TRAIN_BASE_START TRAIN_START_RAW
+export EXP_NAME OUT_DIR SCRIPT_DIR DOCKER_IMAGE WORKDIR_IN_CONTAINER QDATA_HOST_DIR OUT_DIR_IN_CONTAINER
+
+mkdir -p "$LOG_DIR"
+mkdir -p "$OUT_DIR/data_health" "$OUT_DIR/model_predict" "$OUT_DIR/first_screen" "$OUT_DIR/risk_eval" "$OUT_DIR/second_screen" "$OUT_DIR/final_result"
+
+echo "============================================================"
+echo "  run_alpha158_small"
+echo "  experiment : $EXP_NAME"
+echo "  market     : $TARGET_MARKET"
+echo "  benchmark  : $TARGET_BENCHMARK"
+echo "  T (本周五) : $T"
+if [[ -n "$DATA_LATEST_DATE" ]]; then
+	echo "  数据最新日 : $DATA_LATEST_DATE"
+fi
+echo "  训练集     : $TRAIN_START ~ $TRAIN_END"
+echo "  验证集     : $VALID_START ~ $VALID_END"
+echo "  测试集     : $TEST_START ~ $TEST_END"
+echo "  预测日期   : $PRED_DATE"
+if [[ "$TEST_END" != "$TARGET_TEST_END" ]]; then
+	echo "  说明       : 本地 qlib 数据尚未更新到当前周，预测日已自动裁剪到数据最新日"
+fi
+echo "  单票预算   : ¥${PER_STOCK_BUDGET_RAW}"
+echo "  最高股价   : ¥${MAX_STOCK_PRICE}"
+echo "  半衰期     : $SAMPLE_WEIGHT_HALF_LIFE"
+echo "  stage2折数 : ${STAGE2_MAX_FOLDS:-0} (0=全部)"
+echo "  stage      : $START_STAGE → $END_STAGE"
+echo "  output     : $OUT_DIR"
+echo "============================================================"
+
+run_stage1() {
+	echo ""
+	echo "╔══════════════════════════════════════════╗"
+	echo "║  STAGE 1 — 数据准备 / 健康检查          ║"
+	echo "╚══════════════════════════════════════════╝"
+	local log="$LOG_DIR/stage1.log"
+
+	(
+		set -euo pipefail
+
+		local source_qlib_dir="$QDATA_HOST_DIR/qlib_data/cn_data"
+		local filtered_qlib_dir="$QDATA_HOST_DIR/qlib_data/cn_data_filter_small"
+		echo "[1/2] 数据路径: $source_qlib_dir"
+		if [[ ! -d "$source_qlib_dir" ]]; then
+			echo "✗ qlib 数据目录不存在: $source_qlib_dir" >&2
+			exit 1
+		fi
+
+		echo "[2/2] 构建中证1000专用数据视图: $filtered_qlib_dir"
+		docker run --rm \
+			-e PRED_DATE \
+			-e TARGET_MARKET \
+			-v "$SCRIPT_DIR:$WORKDIR_IN_CONTAINER" \
+			-v "$QDATA_HOST_DIR:/root/.qlib" \
+			-w "$WORKDIR_IN_CONTAINER" \
+			"$DOCKER_IMAGE" \
+			python3 scripts/small/stage1_data_health_small.py \
+			--source-qlib-dir /root/.qlib/qlib_data/cn_data \
+			--qlib-dir /root/.qlib/qlib_data/cn_data_filter_small \
+			--output "$OUT_DIR_IN_CONTAINER/data_health" \
+			--pred-date "$PRED_DATE" \
+			--market "$TARGET_MARKET"
+
+		echo "✓ Stage1 完成 — 中证1000数据健康检查通过"
+	) 2>&1 | tee "$log"
+}
+
+run_stage2() {
+	echo ""
+	echo "╔══════════════════════════════════════════╗"
+	echo "║  STAGE 2 — Walk-forward 训练与预测     ║"
+	echo "╚══════════════════════════════════════════╝"
+	local log="$LOG_DIR/stage2.log"
+
+	(
+		set -euo pipefail
+
+		local YAML_SRC="$WORKFLOW_TEMPLATE"
+		local PRED_OUT_HOST="$OUT_DIR/model_predict"
+		local PRED_OUT_CONTAINER="$OUT_DIR_IN_CONTAINER/model_predict"
+
+		echo "[1/3] 启动 Docker 容器并运行 csi1000 walk-forward stage2"
+		docker run --rm \
+			-e CASH_TOTAL \
+			-e HOLD_NUM \
+			-e TX_FEE_RATE \
+			-e STAMP_DUTY_RATE \
+			-e GM_TOKEN \
+			-e TARGET_MARKET \
+			-e QLIB_DATA_DIR=/root/.qlib/qlib_data/cn_data_filter_small \
+			-e STAGE2_MAX_FOLDS \
+			-e WALK_FORWARD_STEP_YEARS \
+			-e WALK_FORWARD_STEP_WEEKS \
+			-e WALK_FORWARD_TEST_YEARS \
+			-e WALK_FORWARD_TEST_WEEKS \
+			-e WALK_FORWARD_HISTORY_YEARS \
+			-e WALK_FORWARD_SEGMENT_YEARS \
+			-e WALK_FORWARD_START_DATE \
+			-e WALK_FORWARD_END_DATE \
+			-v "$SCRIPT_DIR:$WORKDIR_IN_CONTAINER" \
+			-v "$QDATA_HOST_DIR:/root/.qlib" \
+			-w "$WORKDIR_IN_CONTAINER" \
+			"$DOCKER_IMAGE" \
+			python3 scripts/small/run_stage2_walk_forward_small.py \
+			--template "$YAML_SRC" \
+			--output-root "$PRED_OUT_CONTAINER" \
+			--analysis-root "$WORKDIR_IN_CONTAINER/DATA/analysis_outputs/$EXP_NAME" \
+			--experiment-name "$EXP_NAME" \
+			--uri-folder mlruns \
+			--half-life "$SAMPLE_WEIGHT_HALF_LIFE" \
+			--floor 0.2 \
+			--step-years "$WALK_FORWARD_STEP_YEARS" \
+			--step-weeks "$WALK_FORWARD_STEP_WEEKS" \
+			--test-years "$WALK_FORWARD_TEST_YEARS" \
+			--test-weeks "$WALK_FORWARD_TEST_WEEKS" \
+			--history-years "$WALK_FORWARD_HISTORY_YEARS" \
+			--train-years "$TRAIN_YEARS" \
+			--valid-years "$VALID_YEARS" \
+			--segment-years "$WALK_FORWARD_SEGMENT_YEARS" \
+			--train-base-start "$TRAIN_BASE_START" \
+			--walk-forward-start "$WALK_FORWARD_START_DATE" \
+			--walk-forward-end "$WALK_FORWARD_END_DATE" \
+			--hold-num "$HOLD_NUM" \
+			--model-mode robust
+
+		echo "[2/3] 读取 walk-forward 汇总"
+		if [[ -f "$PRED_OUT_HOST/walk_forward_summary.csv" ]]; then
+			head -20 "$PRED_OUT_HOST/walk_forward_summary.csv"
+		fi
+
+		echo "[3/3] Stage2 完成 — 最新折叠结果保存在: $PRED_OUT_HOST"
+	) 2>&1 | tee "$log"
+}
+
+run_stage3() {
+	echo ""
+	echo "╔══════════════════════════════════════════╗"
+	echo "║  STAGE 3 — 初筛选股（流动性/可交易性）  ║"
+	echo "╚══════════════════════════════════════════╝"
+	local log="$LOG_DIR/stage3.log"
+
+	(
+		set -euo pipefail
+		docker run --rm \
+			--platform linux/amd64 \
+			-e GM_TOKEN \
+			-e QLIB_DATA_DIR=/root/.qlib/qlib_data/cn_data_filter_small \
+			-e PYTHONPATH=/work/scripts/practice \
+			-e PRED_DATE \
+			-v "$SCRIPT_DIR:$WORKDIR_IN_CONTAINER" \
+			-v "$QDATA_HOST_DIR:/root/.qlib" \
+			-w /tmp \
+			"$DOCKER_IMAGE" \
+			python3 /work/scripts/practice/stage3_first_screen.py \
+			--pred-dir  "$OUT_DIR_IN_CONTAINER/model_predict" \
+			--output    "$OUT_DIR_IN_CONTAINER/first_screen" \
+			--pred-date "$PRED_DATE" \
+			--top-n     "$HOLD_NUM" \
+			--max-price "$MAX_STOCK_PRICE" \
+			--market    "$TARGET_MARKET"
+		echo "✓ Stage3 完成 — 初筛结果保存在: $OUT_DIR/first_screen"
+	) 2>&1 | tee "$log"
+}
+
+run_stage4() {
+	echo ""
+	echo "╔══════════════════════════════════════════╗"
+	echo "║  STAGE 4 — 估值 & 风险标签              ║"
+	echo "╚══════════════════════════════════════════╝"
+	local log="$LOG_DIR/stage4.log"
+
+	(
+		set -euo pipefail
+		docker run --rm \
+			--platform linux/amd64 \
+			-e OUT_DIR_IN_CONTAINER \
+			-e PRED_DATE \
+			-v "$SCRIPT_DIR:$WORKDIR_IN_CONTAINER" \
+			-v "$QDATA_HOST_DIR:/root/.qlib" \
+			-w "$WORKDIR_IN_CONTAINER" \
+			"$DOCKER_IMAGE" \
+			bash -lc 'set -euo pipefail; python3 - <<"PY"
+import importlib.util
+import subprocess
+import sys
+if importlib.util.find_spec("baostock") is None:
+		subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "baostock"])
+PY
+python3 scripts/practice/stage4_risk_eval.py --input "$OUT_DIR_IN_CONTAINER/first_screen/first_screen.csv" --output "$OUT_DIR_IN_CONTAINER/risk_eval" --pred-date "$PRED_DATE"'
+		echo "✓ Stage4 完成 — 风险评估保存在: $OUT_DIR/risk_eval"
+	) 2>&1 | tee "$log"
+}
+
+run_stage5() {
+	echo ""
+	echo "╔══════════════════════════════════════════╗"
+	echo "║  STAGE 5 — 二筛（过滤高风险/高估值）    ║"
+	echo "╚══════════════════════════════════════════╝"
+	local log="$LOG_DIR/stage5.log"
+
+	(
+		set -euo pipefail
+		docker run --rm \
+			-e CASH_TOTAL \
+			-e TX_FEE_RATE \
+			-e STAMP_DUTY_RATE \
+			-e HOLD_NUM \
+			-e QLIB_DATA_DIR=/root/.qlib/qlib_data/cn_data_filter_small \
+			-v "$SCRIPT_DIR:$WORKDIR_IN_CONTAINER" \
+			-v "$QDATA_HOST_DIR:/root/.qlib" \
+			-w "$WORKDIR_IN_CONTAINER" \
+			"$DOCKER_IMAGE" \
+			python3 scripts/practice/stage5_second_screen.py \
+			--risk-eval "$OUT_DIR_IN_CONTAINER/risk_eval/risk_eval.csv" \
+			--pred-dir  "$OUT_DIR_IN_CONTAINER/model_predict" \
+			--output    "$OUT_DIR_IN_CONTAINER/second_screen" \
+			--hold-num  "$HOLD_NUM"
+		echo "✓ Stage5 完成 — 二筛结果保存在: $OUT_DIR/second_screen"
+	) 2>&1 | tee "$log"
+}
+
+run_stage6() {
+	echo ""
+	echo "╔══════════════════════════════════════════╗"
+	echo "║  STAGE 6 — 最终结果 & 调仓建议          ║"
+	echo "╚══════════════════════════════════════════╝"
+	local log="$LOG_DIR/stage6.log"
+
+	(
+		set -euo pipefail
+		docker run --rm \
+			-e CASH_TOTAL \
+			-e TX_FEE_RATE \
+			-e STAMP_DUTY_RATE \
+			-e HOLD_NUM \
+			-v "$SCRIPT_DIR:$WORKDIR_IN_CONTAINER" \
+			-v "$QDATA_HOST_DIR:/root/.qlib" \
+			-w "$WORKDIR_IN_CONTAINER" \
+			"$DOCKER_IMAGE" \
+			python3 scripts/practice/stage6_final_result.py \
+			--second-screen "$OUT_DIR_IN_CONTAINER/second_screen/second_screen.csv" \
+			--pred-dir      "$OUT_DIR_IN_CONTAINER/model_predict" \
+			--output        "$OUT_DIR_IN_CONTAINER/final_result" \
+			--hold-num      "$HOLD_NUM" \
+			--bottom-pct    0.50
+		echo "✓ Stage6 完成 — 最终结果保存在: $OUT_DIR/final_result"
+	) 2>&1 | tee "$log"
+}
+
+for stage in $(seq "$START_STAGE" "$END_STAGE"); do
+	case "$stage" in
+		1) run_stage1 ;;
+		2) run_stage2 ;;
+		3) run_stage3 ;;
+		4) run_stage4 ;;
+		5) run_stage5 ;;
+		6) run_stage6 ;;
+		*) echo "Ignoring stage: $stage" >&2 ;;
+	esac
+done
+
+echo ""
+echo "============================================================"
+echo "  全部阶段执行完毕"
+echo "  输出目录: $OUT_DIR"
+echo "============================================================"
