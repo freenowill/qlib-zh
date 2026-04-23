@@ -15,32 +15,11 @@
 ---
 
 ## 2. 使用的镜像（快速开始）
-我们推荐基于镜像 `zhuhai123/qlib-rdagent:v1` 运行（镜像已预装 qlib 与仓库常用依赖，适用于快速复现）。
 
-示例：以交互方式运行容器并把当前仓库以及本地 qlib 数据目录挂载进去
-
-```bash
-# 在仓库根目录执行：
-docker run --rm -it \
-  -v "$PWD:/work" \
-  -v "$HOME/.qlib:/root/.qlib" \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  --env-file "$PWD/.env" \
-  -e DOCKER_HOST=unix:///var/run/docker.sock \
-  -e QLIB_DOCKER_BUILD_FROM_DOCKERFILE=false \
-  -e QLIB_DOCKER_IMAGE=local_qlib:latest \
-  -e CONDA_DEFAULT_ENV=qlib_env \
-  -p 10086:10086 \
-  -w /work \
-  zhuhai123/qlib-rdagent:v1 \
-  /bin/bash
 ```
-
-说明：
-- `-v "$PWD:/work"`：把当前仓库挂到容器的 `/work`，容器内在 `/work` 可直接访问代码。
-- `-v "$HOME/.qlib:/root/.qlib"`：把主机上 qlib 数据目录挂到容器内的 qlib 数据路径（如果尚未下载数据，可先在主机下载到 `~/.qlib`，后续说明）。
-
----
+docker pull zhuhai123/local_qlib:latest
+docker pull zhuhai123/qlib-rdagen:v1
+```
 
 ## 3. Qlib 数据下载（保持原方法）
 项目中使用的 qlib 数据可参考并下载：
