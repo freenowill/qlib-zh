@@ -28,14 +28,18 @@ def main() -> None:
     template_root = root / "scripts" / "small" / "templates"
     module.MODEL_SPECS = [
         {
-            "name": "xgboost",
+            "name": "csi1000_xgboost",
             "template": template_root / "workflow_config_xgboost_Alpha158_csi1000.yaml",
             "model_mode": "default",
+            "route": "csi1000",
+            "universe_role": "target",
         },
         {
-            "name": "lightgbm",
+            "name": "csi1000_lightgbm",
             "template": template_root / "workflow_config_lightgbm_Alpha158_csi1000.yaml",
             "model_mode": "robust",
+            "route": "csi1000",
+            "universe_role": "target",
         },
     ]
 

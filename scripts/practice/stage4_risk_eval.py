@@ -421,8 +421,66 @@ def _financial_score(bundle: dict) -> tuple[float, dict[str, float]]:
     return score, {"prof": prof, "solv": solv, "oper": oper, "grow": grow}
 
 
+def _build_fallback_result(pool: pd.DataFrame, pred_date: str) -> pd.DataFrame:
+    """Build a neutral risk-eval table when baostock is temporarily unavailable."""
+    result = pool.copy()
+    if "pred_date" not in result.columns:
+        result["pred_date"] = pred_date
+    if "date" not in result.columns:
+        result["date"] = pred_date
+
+    defaults = {
+        "ipo_date": pd.NaT,
+        "close": np.nan,
+        "pe_ttm": np.nan,
+        "pb": np.nan,
+        "ps": np.nan,
+        "industry": "未知",
+        "financial_score": 50.0,
+        "financial_label": "中",
+        "valuation_score": 50.0,
+        "valuation_label": "中",
+        "negative_news_count": 0,
+        "risk_score": 35.0,
+        "risk_label": "中",
+        "is_st": False,
+        "is_suspended": False,
+        "prof_score": 50.0,
+        "solv_score": 50.0,
+        "oper_score": 50.0,
+        "grow_score": 50.0,
+    }
+    for col, default in defaults.items():
+        if col not in result.columns:
+            result[col] = default
+        else:
+            result[col] = result[col].where(result[col].notna(), default)
+
+    result["is_st"] = pd.Series(result.get("is_st", False), index=result.index).fillna(False).astype(bool)
+    result["is_suspended"] = pd.Series(result.get("is_suspended", False), index=result.index).fillna(False).astype(bool)
+    for col in [
+        "financial_score",
+        "valuation_score",
+        "risk_score",
+        "negative_news_count",
+        "prof_score",
+        "solv_score",
+        "oper_score",
+        "grow_score",
+    ]:
+        result[col] = pd.to_numeric(result[col], errors="coerce")
+
+    return result
+
+
 def risk_eval(input_csv: str, output_dir: str, pred_date: str):
-    _login()
+    login_error = None
+    try:
+        _login()
+    except Exception as exc:
+        login_error = exc
+        print(f"⚠ baostock 登录失败，stage4 切换到本地降级模式: {exc}")
+
     try:
         out_path = Path(output_dir)
         out_path.mkdir(parents=True, exist_ok=True)
@@ -437,6 +495,14 @@ def risk_eval(input_csv: str, output_dir: str, pred_date: str):
             pool["code"] = pool["instrument"].astype(str)
         pool["code"] = pool["code"].astype(str).map(_to_6digit)
         print(f"✓ 加载初筛结果: {len(pool)} 只股票")
+
+        if login_error is not None:
+            result = _build_fallback_result(pool, pred_date)
+            out_csv = out_path / "risk_eval.csv"
+            result.to_csv(out_csv, index=False, encoding="utf-8-sig")
+            print("✓ 已输出 stage4 降级结果（中性财务/估值/风险标签）")
+            print(f"✓ 风险评估保存: {out_csv}")
+            return
 
         q = _quarter_of_date(pred_date)
         rows = []

@@ -53,6 +53,8 @@ export CASH_TOTAL="${CASH_TOTAL:-100000}"
 export TX_FEE_RATE="${TX_FEE_RATE:-0.0001}"
 export STAMP_DUTY_RATE="${STAMP_DUTY_RATE:-0.0005}"
 export HOLD_NUM="${HOLD_NUM:-20}"
+export FULL_BACKTEST_STRATEGY="${FULL_BACKTEST_STRATEGY:-buffered_equal_weight_topk}"
+export FULL_BACKTEST_BUFFER_PCT="${FULL_BACKTEST_BUFFER_PCT:-0.5}"
 PER_STOCK_BUDGET_RAW=$(( CASH_TOTAL / HOLD_NUM ))
 MAX_STOCK_PRICE=$(python3 - <<'PY'
 import math, os
@@ -174,6 +176,8 @@ if [[ "$TEST_END" != "$TARGET_TEST_END" ]]; then
 fi
 echo "  单票预算   : ¥${PER_STOCK_BUDGET_RAW}"
 echo "  最高股价   : ¥${MAX_STOCK_PRICE}"
+echo "  回测策略   : ${FULL_BACKTEST_STRATEGY}"
+echo "  换手缓冲   : ${FULL_BACKTEST_BUFFER_PCT}"
 echo "  半衰期     : $SAMPLE_WEIGHT_HALF_LIFE"
 echo "  stage2折数 : ${STAGE2_MAX_FOLDS:-0} (0=全部)"
 echo "  stage      : $START_STAGE → $END_STAGE"
@@ -237,6 +241,8 @@ run_stage2() {
 			-e HOLD_NUM \
 			-e TX_FEE_RATE \
 			-e STAMP_DUTY_RATE \
+			-e FULL_BACKTEST_STRATEGY \
+			-e FULL_BACKTEST_BUFFER_PCT \
 			-e GM_TOKEN \
 			-e TARGET_MARKET \
 			-e QLIB_DATA_DIR=/root/.qlib/qlib_data/cn_data_filter_small \

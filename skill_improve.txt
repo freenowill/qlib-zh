@@ -1,0 +1,95 @@
+run_alpha158_small 优化记录（2026-04-22）
+
+一、已完成的优化
+
+1. 入口解耦：run_alpha158_small 不再直接委托 run_alpha158_practice
+	- 原问题：small 与 practice 共用入口，small 的修改容易影响 practice。
+	- 优化后：run_alpha158_small 已独立承载参数、日期窗口、stage 调度与 small 专用脚本调用。
+	- 收益：工程边界更清晰，small / practice 两套流程可独立演进。
+
+2. 为 csi1000 建立独立 stage1 数据视图
+	- 新增脚本：scripts/small/stage1_data_health_small.py
+	- 原则：保留原始 Qlib instruments 文件，不对代码格式做破坏性重写；同时单独生成 cn_data_filter_small。
+	- 收益：small 流程使用独立 provider_uri，避免与 practice 共用过滤数据目录造成串扰。
+
+3. 为 csi1000 建立独立 stage2 模板
+	- 新增模板：
+	  - scripts/small/templates/workflow_config_lightgbm_Alpha158_csi1000.yaml
+	  - scripts/small/templates/workflow_config_xgboost_Alpha158_csi1000.yaml
+	- 模板显式设定：
+	  - market = csi1000
+	  - benchmark = SH000852
+	  - instruments = csi1000
+	- 收益：训练宇宙、回测基准、预测输出三者一致，减少“训练不是 csi1000、筛选才是 csi1000”的风格漂移。
+
+4. 为 stage2 新增 small 专用 wrapper
+	- 新增脚本：scripts/small/run_stage2_walk_forward_small.py
+	- 功能：
+	  - 替换 MODEL_SPECS，指向 csi1000 专用模板；
+	  - 支持 STAGE2_MAX_FOLDS，用于快速 smoke test。
+	- 收益：能够在不改 practice 主逻辑的情况下，对 small 专用 stage2 做单独增强。
+
+5. 保留严格因果划分，避免未来函数
+	- stage2 使用 walk-forward 因果窗口：train -> valid -> test 严格顺序，且不重叠；
+	- pred_date 取 test_end；
+	- stage3 使用 pred_date 对本地指数成分做当日有效过滤；
+	- 收益：训练、预测、后续选股链路具备一致的时序约束。
+
+6. 多模型融合已纳入 stage2 主流程
+	- XGBoost + LightGBM 顺序训练；
+	- 使用验证期 IC 作为融合权重；
+	- 输出 score_final、valid_ic_xgboost、valid_ic_lightgbm、weight_xgboost、weight_lightgbm。
+	- 收益：比单模型更稳健，降低单一模型 regime failure 风险。
+
+7. 组合层已引入 Risk Parity 思想
+	- stage5 / stage6 已结合 60 日波动率生成 risk_parity_weight；
+	- 收益：组合不是简单等权，具备基础风险预算能力，更接近实盘要求。
+
+8. 实盘约束已从入口统一传递
+	- 账户资金、持仓数、手续费、印花税、最高股价等环境变量由 run_alpha158_small 统一定义；
+	- 收益：stage3/5/6 的下游逻辑共享同一套交易假设，提升回测与实盘一致性。
+
+9. 将 Risk Parity 前移到 stage2 full-cycle backtest 层
+	- 原问题：stage2 的 full backtest 使用 TopK 等权逻辑，而 stage5 / stage6 才使用 Risk Parity 权重。
+	- 优化后：stage2 full-cycle backtest 改为优先使用 stage3~stage6 replay 生成的目标权重信号；若 replay 不可用，则回退到基于 raw stage2 score + 60日波动率 的 Risk-Parity 风格加权信号。
+	- 实现方式：
+	  - 在 scripts/practice/run_stage2_walk_forward.py 中新增 raw signal -> 风险平价权重信号转换逻辑；
+	  - 使用 WeightStrategyBase 风格的预计算权重策略替代原先的 TopkDropoutStrategy 等权回测；
+	  - full_backtest 输出中增加 signal_raw.csv，并在 report_of_backtest 中记录 signal source。
+	- 收益：训练评估层与执行层的组合逻辑更一致，显著减少“stage2 看起来收益高，但 stage5/6 真正执行后风格漂移”的偏差。
+
+10. 为 run_alpha158_small 增加 20 股票低换手全周期回测策略
+	- 新策略目标：以 model_predict 的原始 score 排名为准，只持有 20 只股票，尽量等金额分配，减少无效换手，并尽量不留现金。
+	- 实现方式：
+	  - run_alpha158_small 的 full_backtest 统一按 20 只目标持仓生成组合；
+	  - stage2 full_backtest 新增 `buffered_equal_weight_topk` 模式；
+	  - 每周只在信号日的下一交易日调仓；
+	  - 现有持仓只有在当期 `score` 横截面排名跌出前 50%（csi1000 约前 500 名）后才剔除；
+	  - 空缺仓位用当前得分最高且可交易约束下可纳入的股票补齐；
+	  - 目标仓位按 20 只股票等权生成，risk_degree 提高到 1.0，以尽量贴近满仓。
+	- 收益：full_backtest 与用户指定的“20只股票、等金额、只剔除跌出前50%者、低换手、尽量满仓”规则一致，且不再依赖 stage3~stage6 replay 的外部数据链路。
+
+11. 在权重策略层增加“当日不可交易股票二次再分配”
+	- 原问题：即使目标权重已经生成，若某些候选股在调仓日不可交易，Qlib 的无交互权重订单生成器会直接跳过这些新买入目标，导致现金残留偏高。
+	- 优化后：在预计算权重策略中新增本地订单生成器，先识别调仓日不可交易的新目标，再把被跳过的目标权重二次分配给当日可交易的其它目标股票。
+	- 设计细节：
+	  - 对当前已持有但当日不可交易的股票，保留其目标权重占位，避免过度挤压；
+	  - 对“原本想买但当日不可交易”的股票，将其权重重新归一分配到其余可交易目标；
+	  - 仍然使用 pred_date 可得价格做目标股数估算，保持因果一致。
+	- 收益：进一步压低 full_backtest 的现金占比，使组合更接近“等金额、少留现金”的实盘目标。
+
+12. 将 stage2 升级为 all-market + csi1000 双路模型融合
+	- 新结构：stage2 不再只训练 csi1000 单一路径，而是并行训练两条信息源：
+	  - csi1000 路：专注目标交易域的小盘风格排序；
+	  - all-market 路：利用全市场横截面样本学习更稳健的通用因子结构。
+	- 实现方式：
+	  - small wrapper 的 MODEL_SPECS 扩展为 4 个基础模型：`csi1000_xgboost`、`csi1000_lightgbm`、`allmarket_xgboost`、`allmarket_lightgbm`；
+	  - 新增 all-market 专用模板，训练 universe 使用 `all`，但 provider 仍复用独立 small 数据视图，保证工程隔离；
+	  - 融合层按 route 分两级计算权重：先算 `csi1000` 路与 `allmarket` 路的 validation IC 强度，再算各 route 内部模型权重，最后得到非负、可解释的双路融合权重；
+	  - 最终 ensemble 输出以 csi1000 路模型的预测索引为锚点，确保导出的 `scores.csv` 和 full_backtest 仍然只面向 csi1000 可交易宇宙。
+	- 收益：兼顾“目标域贴近性”和“全市场统计稳健性”，比单一路径更适合 walk-forward 下的小盘实盘选股。
+	- 当前落地版本：为保证资源稳定性，已先裁剪为 3 模型结构：`csi1000_xgboost` + `csi1000_lightgbm` + `allmarket_lightgbm`。
+
+
+
+

@@ -68,6 +68,17 @@ MODEL_SPECS = [
 ]
 
 
+def _target_route_model_names() -> list[str]:
+    return [str(spec["name"]) for spec in MODEL_SPECS if str(spec.get("universe_role", "")).strip().lower() == "target"]
+
+
+def _model_spec_by_name(name: str) -> dict[str, object] | None:
+    for spec in MODEL_SPECS:
+        if str(spec.get("name")) == str(name):
+            return spec
+    return None
+
+
 def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     subprocess.run(cmd, cwd=str(cwd or ROOT), env=env, check=True)
 
@@ -211,21 +222,61 @@ def _compute_strategy_metrics(pred_df: pd.DataFrame, label_df: pd.DataFrame, hol
 
 
 def _compute_ensemble_weights(validation_ics: dict[str, float]) -> dict[str, float]:
-    ordered_names = [spec["name"] for spec in MODEL_SPECS]
-    raw = np.array([float(validation_ics.get(name, np.nan)) for name in ordered_names], dtype=float)
-    raw = np.where(np.isfinite(raw), raw, 0.0)
-    total = raw.sum()
-    if abs(total) < 1e-12:
-        weights = np.repeat(1.0 / len(ordered_names), len(ordered_names))
+    ordered_names = [str(spec["name"]) for spec in MODEL_SPECS]
+    route_map = {name: str((_model_spec_by_name(name) or {}).get("route", "default")) for name in ordered_names}
+    raw_map = {}
+    for name in ordered_names:
+        val = float(validation_ics.get(name, np.nan))
+        raw_map[name] = max(val, 0.0) if np.isfinite(val) else 0.0
+
+    unique_routes = list(dict.fromkeys(route_map.values()))
+    if len(unique_routes) <= 1:
+        raw = np.array([raw_map[name] for name in ordered_names], dtype=float)
+        total = float(raw.sum())
+        if total <= 1e-12:
+            weights = np.repeat(1.0 / max(len(ordered_names), 1), len(ordered_names))
+        else:
+            weights = raw / total
+        return {name: float(weight) for name, weight in zip(ordered_names, weights)}
+
+    route_strength = {}
+    for route in unique_routes:
+        route_names = [name for name in ordered_names if route_map[name] == route]
+        route_raw = np.array([raw_map[name] for name in route_names], dtype=float)
+        route_strength[route] = float(route_raw.mean()) if route_raw.size else 0.0
+
+    route_total = float(sum(route_strength.values()))
+    if route_total <= 1e-12:
+        route_weights = {route: 1.0 / max(len(unique_routes), 1) for route in unique_routes}
     else:
-        weights = raw / total
-    return {name: float(weight) for name, weight in zip(ordered_names, weights)}
+        route_weights = {route: strength / route_total for route, strength in route_strength.items()}
+
+    weights: dict[str, float] = {}
+    for route in unique_routes:
+        route_names = [name for name in ordered_names if route_map[name] == route]
+        route_raw = np.array([raw_map[name] for name in route_names], dtype=float)
+        within_total = float(route_raw.sum())
+        if within_total <= 1e-12:
+            within_weights = np.repeat(1.0 / max(len(route_names), 1), len(route_names))
+        else:
+            within_weights = route_raw / within_total
+        for name, within_weight in zip(route_names, within_weights):
+            weights[name] = float(route_weights[route] * within_weight)
+
+    final_total = float(sum(weights.values()))
+    if final_total > 0:
+        weights = {name: float(weight / final_total) for name, weight in weights.items()}
+    return weights
 
 
 def _combine_model_predictions(model_frames: dict[str, pd.DataFrame], weights: dict[str, float]) -> pd.DataFrame:
     combined = None
+    target_index = None
+    target_names = set(_target_route_model_names())
     for name, frame in model_frames.items():
         score_df = _to_score_frame(frame, score_col="score")
+        if name in target_names:
+            target_index = score_df.index if target_index is None else target_index.intersection(score_df.index)
         score_df = _daily_rank_gaussian(score_df, "score").rename(columns={"score": f"score_{name}"})
         if combined is None:
             combined = score_df
@@ -234,6 +285,9 @@ def _combine_model_predictions(model_frames: dict[str, pd.DataFrame], weights: d
 
     if combined is None or combined.empty:
         raise RuntimeError("No model predictions available for ensemble")
+
+    if target_index is not None and len(target_index) > 0:
+        combined = combined.reindex(target_index)
 
     score_cols = []
     combined = combined.sort_index()
@@ -673,6 +727,19 @@ def _train_single_model_fold(
         train_base_start=train_base_start,
     )
 
+    existing_run_dir = model_dir / "mlflow_run"
+    existing_artifacts = existing_run_dir / "artifacts"
+    required_artifacts = [
+        existing_artifacts / "pred.pkl",
+        existing_artifacts / "label.pkl",
+        existing_artifacts / "valid_pred.pkl",
+        existing_artifacts / "valid_label.pkl",
+        existing_artifacts / "params.pkl",
+    ]
+    if all(path.exists() for path in required_artifacts):
+        print(f"      reuse cached run: {model_name} -> {existing_run_dir}")
+        return existing_run_dir, f"{experiment_name}_wf_{fold['signal_date']}_{model_name}"
+
     experiment_tag = f"{experiment_name}_wf_{fold['signal_date']}_{model_name}"
     start_ts = time.time()
     if warm_start_checkpoint is not None:
@@ -728,9 +795,9 @@ def _build_ensemble_fold_output(
     model_artifacts: dict[str, Path] = {}
     validation_ics: dict[str, float] = {}
     test_preds: dict[str, pd.DataFrame] = {}
-    label_df: pd.DataFrame | None = None
+    label_frames: dict[str, pd.DataFrame] = {}
 
-    print("  → sequential base models: XGBoost → LightGBM")
+    print(f"  → sequential base models: {', '.join(str(spec['name']) for spec in MODEL_SPECS)}")
     for spec in MODEL_SPECS:
         model_name = str(spec["name"])
         print(f"    · training {model_name}")
@@ -756,8 +823,16 @@ def _build_ensemble_fold_output(
         validation_ics[model_name] = ic_mean
 
         test_preds[model_name] = _to_score_frame(_load_pickle(artifacts / "pred.pkl"), "score")
-        if label_df is None:
-            label_df = _to_label_frame(_load_pickle(artifacts / "label.pkl"))
+        label_frames[model_name] = _to_label_frame(_load_pickle(artifacts / "label.pkl"))
+
+    target_names = _target_route_model_names()
+    label_df = None
+    for model_name in target_names:
+        if model_name in label_frames:
+            label_df = label_frames[model_name]
+            break
+    if label_df is None and label_frames:
+        label_df = next(iter(label_frames.values()))
 
     if label_df is None:
         raise RuntimeError("No test label data found for ensemble fold")
@@ -1173,6 +1248,401 @@ def _build_stage36_full_signal(
     return signal_df
 
 
+def _get_price_cap() -> float:
+    return float(os.environ.get("MAX_STOCK_PRICE", 50.0) or 50.0)
+
+
+def _shift_signal_to_next_trade_dates(signal_df: pd.DataFrame, cal: pd.DatetimeIndex) -> pd.DataFrame:
+    """Keep one signal per ISO week and shift it to the next trading day."""
+    if signal_df.empty:
+        return signal_df
+
+    df = signal_df.reset_index().copy()
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["instrument"] = df["instrument"].astype(str)
+    keep_cols = [c for c in df.columns if c not in {"datetime", "instrument"}]
+    for col in keep_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    required_cols = ["datetime", "instrument"] + (["score"] if "score" in df.columns else [])
+    df = df.dropna(subset=required_cols)
+    if df.empty:
+        return signal_df.iloc[0:0]
+
+    weekly_dates = (
+        df[["datetime"]]
+        .drop_duplicates()
+        .assign(
+            iso_year=lambda x: pd.to_datetime(x["datetime"]).dt.isocalendar().year,
+            iso_week=lambda x: pd.to_datetime(x["datetime"]).dt.isocalendar().week,
+        )
+        .groupby(["iso_year", "iso_week"], as_index=False)["datetime"]
+        .max()["datetime"]
+    )
+    df = df[df["datetime"].isin(set(pd.to_datetime(weekly_dates)))]
+    if df.empty:
+        return signal_df.iloc[0:0]
+
+    trade_dates = []
+    for dt in pd.to_datetime(df["datetime"]):
+        pos = int(cal.searchsorted(dt, side="right"))
+        trade_dates.append(pd.Timestamp(cal[pos]) if pos < len(cal) else pd.NaT)
+
+    df["trade_datetime"] = trade_dates
+    df = df.dropna(subset=["trade_datetime"])
+    if df.empty:
+        return signal_df.iloc[0:0]
+
+    df = df.drop(columns=["datetime"]).rename(columns={"trade_datetime": "datetime"})
+    df = df.drop_duplicates(subset=["datetime", "instrument"], keep="last")
+    df = df.sort_values(["datetime", "instrument"])
+    shifted = df.set_index(["datetime", "instrument"])[keep_cols]
+    shifted.index = shifted.index.set_names(["datetime", "instrument"])
+    return shifted
+
+
+def _build_buffered_equal_weight_signal(
+    signal_df: pd.DataFrame,
+    cal: pd.DatetimeIndex,
+    hold_num: int,
+    price_cap: float,
+    dropout_buffer_pct: float = 0.5,
+) -> pd.DataFrame:
+    """Build a live-aligned Top-K portfolio with a global-rank buffer and equal target weights.
+
+    Rules:
+    1. Use raw stage2 score ranking as the selection source.
+    2. Hold at most `hold_num` stocks.
+    3. Existing holdings are kept if they remain within the top
+         `dropout_buffer_pct` fraction of the whole cross-sectional universe.
+         For example, with a csi1000 universe and dropout_buffer_pct=0.5,
+         holdings are only sold after they fall out of roughly the top 500 names.
+    4. Vacancies are filled by the highest-score affordable stocks.
+    5. Final target weights are equal-weighted across the selected holdings.
+    """
+    if signal_df.empty:
+        return pd.DataFrame(columns=["score", "weight", "rank", "close", "selected"])
+
+    from qlib.data import D
+
+    shifted_signal = _shift_signal_to_next_trade_dates(signal_df[["score"]], cal)
+    if shifted_signal.empty:
+        return pd.DataFrame(columns=["score", "weight", "rank", "close", "selected"])
+
+    shifted_df = shifted_signal.reset_index().copy()
+    shifted_df["datetime"] = pd.to_datetime(shifted_df["datetime"], errors="coerce")
+    shifted_df["instrument"] = shifted_df["instrument"].astype(str)
+    shifted_df["score"] = pd.to_numeric(shifted_df["score"], errors="coerce")
+    shifted_df = shifted_df.dropna(subset=["datetime", "instrument", "score"])
+    if shifted_df.empty:
+        return pd.DataFrame(columns=["score", "weight", "rank", "close", "selected"])
+
+    instruments = sorted(shifted_df["instrument"].unique().tolist())
+    start_time = pd.Timestamp(shifted_df["datetime"].min()).strftime("%Y-%m-%d")
+    end_time = pd.Timestamp(shifted_df["datetime"].max()).strftime("%Y-%m-%d")
+    close_df = D.features(instruments, ["$close"], start_time=start_time, end_time=end_time)
+    if close_df is None or len(close_df) == 0:
+        return pd.DataFrame(columns=["score", "weight", "rank", "close", "selected"])
+
+    if isinstance(close_df, pd.Series):
+        close_df = close_df.to_frame("close")
+    else:
+        close_df = close_df.copy()
+    if isinstance(close_df.index, pd.MultiIndex):
+        close_df = close_df.reset_index()
+    if "datetime" not in close_df.columns or "instrument" not in close_df.columns:
+        return pd.DataFrame(columns=["score", "weight", "rank", "close", "selected"])
+
+    close_col = "close" if "close" in close_df.columns else close_df.columns[-1]
+    close_df["datetime"] = pd.to_datetime(close_df["datetime"], errors="coerce")
+    close_df["instrument"] = close_df["instrument"].astype(str)
+    close_df[close_col] = pd.to_numeric(close_df[close_col], errors="coerce")
+    close_df = close_df[["datetime", "instrument", close_col]].dropna()
+    close_df = close_df.rename(columns={close_col: "close"})
+
+    ranked = shifted_df.merge(close_df, on=["datetime", "instrument"], how="left")
+    ranked["close"] = pd.to_numeric(ranked["close"], errors="coerce")
+    ranked["is_affordable"] = ranked["close"].notna() & (ranked["close"] <= float(price_cap))
+
+    prev_holdings: list[str] = []
+    frames: list[pd.DataFrame] = []
+
+    for dt, grp in ranked.groupby("datetime", sort=True):
+        grp = grp.sort_values(["score", "instrument"], ascending=[False, True], na_position="last").reset_index(drop=True)
+        if grp.empty:
+            continue
+        grp["rank"] = np.arange(1, len(grp) + 1)
+        keep_rank_cutoff = max(int(hold_num), int(np.ceil(len(grp) * max(float(dropout_buffer_pct), 0.0))))
+        affordable = grp[grp["is_affordable"]].copy().reset_index(drop=True)
+        if affordable.empty:
+            prev_holdings = []
+            continue
+
+        rank_map = affordable.set_index("instrument")["rank"].to_dict()
+        kept = [
+            code
+            for code in prev_holdings
+            if code in rank_map and int(rank_map[code]) <= keep_rank_cutoff
+        ]
+        kept = sorted(kept, key=lambda code: (int(rank_map.get(code, 10**9)), code))[:hold_num]
+
+        additions = [code for code in affordable["instrument"].tolist() if code not in kept]
+        target_codes = kept + additions[: max(int(hold_num) - len(kept), 0)]
+        if not target_codes:
+            prev_holdings = []
+            continue
+
+        selected = affordable.set_index("instrument").loc[target_codes].reset_index()
+        selected["selected"] = np.where(selected["instrument"].isin(kept), "keep", "buy")
+        selected["weight"] = 1.0 / float(len(selected))
+        selected["datetime"] = pd.Timestamp(dt)
+        frames.append(selected[["datetime", "instrument", "score", "weight", "rank", "close", "selected"]])
+        prev_holdings = list(target_codes)
+
+    if not frames:
+        return pd.DataFrame(columns=["score", "weight", "rank", "close", "selected"])
+
+    out = pd.concat(frames, ignore_index=True)
+    out = out.drop_duplicates(subset=["datetime", "instrument"], keep="last")
+    out = out.sort_values(["datetime", "rank", "instrument"])
+    out = out.set_index(["datetime", "instrument"])[["score", "weight", "rank", "close", "selected"]]
+    out.index = out.index.set_names(["datetime", "instrument"])
+    return out
+
+
+def _build_risk_parity_signal_from_raw_signal(
+    signal_df: pd.DataFrame,
+    hold_num: int,
+    lookback_days: int = 60,
+    score_mix: float = 0.7,
+    vol_mix: float = 0.3,
+) -> pd.DataFrame:
+    """Convert raw stage2 scores into a weighted signal using a Risk-Parity style blend.
+
+    The target weight is built from two components:
+    1. cross-sectional normalized score strength
+    2. inverse-volatility allocation over the selected Top-K names
+
+    This is used as a fallback when the full stage3~stage6 replay signal is not
+    available, so the stage2 backtest is still closer to the live portfolio
+    construction logic than a plain equal-weight TopK replay.
+    """
+    if signal_df.empty:
+        return pd.DataFrame(columns=["score", "weight", "volatility_60d"])
+
+    from qlib.data import D
+
+    df = signal_df.reset_index().copy()
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["instrument"] = df["instrument"].astype(str)
+    df["score"] = pd.to_numeric(df["score"], errors="coerce")
+    df = df.dropna(subset=["datetime", "instrument", "score"])
+    if df.empty:
+        return pd.DataFrame(columns=["score", "weight", "volatility_60d"])
+
+    instruments = sorted(df["instrument"].unique().tolist())
+    start_time = (pd.Timestamp(df["datetime"].min()) - pd.Timedelta(days=lookback_days * 3)).strftime("%Y-%m-%d")
+    end_time = pd.Timestamp(df["datetime"].max()).strftime("%Y-%m-%d")
+    close_df = D.features(instruments, ["$close"], start_time=start_time, end_time=end_time)
+
+    close_map: dict[str, pd.Series] = {}
+    if close_df is not None and len(close_df) > 0:
+        if isinstance(close_df, pd.Series):
+            close_df = close_df.to_frame("close")
+        else:
+            close_df = close_df.copy()
+        if isinstance(close_df.index, pd.MultiIndex):
+            close_df = close_df.reset_index()
+        if "datetime" in close_df.columns and "instrument" in close_df.columns:
+            close_col = "close" if "close" in close_df.columns else close_df.columns[-1]
+            close_df["datetime"] = pd.to_datetime(close_df["datetime"], errors="coerce")
+            close_df["instrument"] = close_df["instrument"].astype(str)
+            close_df[close_col] = pd.to_numeric(close_df[close_col], errors="coerce")
+            close_df = close_df[["datetime", "instrument", close_col]].dropna()
+            close_df = close_df.rename(columns={close_col: "close"})
+            close_df = close_df.sort_values(["instrument", "datetime"])
+            close_df["ret"] = close_df.groupby("instrument")["close"].pct_change()
+            close_map = {
+                inst: grp.set_index("datetime")["ret"].sort_index() for inst, grp in close_df.groupby("instrument")
+            }
+
+    frames: list[pd.DataFrame] = []
+    for dt, grp in df.groupby("datetime", sort=True):
+        pick = grp.sort_values("score", ascending=False).head(max(int(hold_num), 1)).copy()
+        if pick.empty:
+            continue
+
+        score_values = pd.to_numeric(pick["score"], errors="coerce")
+        if score_values.notna().sum() <= 1:
+            score_weight = pd.Series(1.0 / len(pick), index=pick.index, dtype=float)
+        else:
+            lo, hi = float(score_values.min()), float(score_values.max())
+            if hi > lo:
+                score_weight = ((score_values - lo) / (hi - lo)).fillna(0.0)
+                if float(score_weight.sum()) <= 0:
+                    score_weight = pd.Series(1.0 / len(pick), index=pick.index, dtype=float)
+                else:
+                    score_weight = score_weight / float(score_weight.sum())
+            else:
+                score_weight = pd.Series(1.0 / len(pick), index=pick.index, dtype=float)
+
+        vols = []
+        for inst in pick["instrument"].astype(str):
+            ret_s = close_map.get(inst)
+            if ret_s is None or ret_s.empty:
+                vols.append(np.nan)
+                continue
+            hist = ret_s[ret_s.index < dt].dropna().tail(lookback_days)
+            if len(hist) < 5:
+                vols.append(np.nan)
+            else:
+                vols.append(float(hist.std(ddof=1)))
+        pick["volatility_60d"] = vols
+
+        inv_vol = 1.0 / pd.to_numeric(pick["volatility_60d"], errors="coerce").replace(0, np.nan)
+        inv_vol = inv_vol.replace([np.inf, -np.inf], np.nan)
+        if inv_vol.notna().sum() == 0:
+            vol_weight = pd.Series(1.0 / len(pick), index=pick.index, dtype=float)
+        else:
+            fill_value = float(inv_vol.dropna().median()) if inv_vol.notna().any() else 1.0
+            inv_vol = inv_vol.fillna(fill_value)
+            vol_weight = inv_vol / float(inv_vol.sum())
+
+        combined = score_mix * score_weight + vol_mix * vol_weight
+        if combined.isna().all() or float(combined.sum()) <= 0:
+            combined = pd.Series(1.0 / len(pick), index=pick.index, dtype=float)
+        else:
+            combined = combined.fillna(0.0)
+            combined = combined / float(combined.sum())
+
+        pick["weight"] = combined.astype(float)
+        frames.append(pick[["datetime", "instrument", "score", "weight", "volatility_60d"]])
+
+    if not frames:
+        return pd.DataFrame(columns=["score", "weight", "volatility_60d"])
+
+    out = pd.concat(frames, ignore_index=True)
+    out = out.drop_duplicates(subset=["datetime", "instrument"], keep="last")
+    out = out.sort_values(["datetime", "instrument"])
+    out = out.set_index(["datetime", "instrument"])[["score", "weight", "volatility_60d"]]
+    out.index = out.index.set_names(["datetime", "instrument"])
+    return out
+
+
+class PrecomputedWeightStrategy:
+    """Factory wrapper around Qlib WeightStrategyBase for precomputed target weights."""
+
+    @staticmethod
+    def create(signal, risk_degree: float = 0.95):
+        from qlib.contrib.strategy.order_generator import OrderGenWOInteract
+        from qlib.contrib.strategy.signal_strategy import WeightStrategyBase
+
+        class _RedistributingOrderGenWOInteract(OrderGenWOInteract):
+            """Redistribute dropped non-tradable buy weights to tradable targets on trade date."""
+
+            def generate_order_list_from_target_weight_position(
+                self,
+                current,
+                trade_exchange,
+                target_weight_position,
+                risk_degree,
+                pred_start_time,
+                pred_end_time,
+                trade_start_time,
+                trade_end_time,
+            ):
+                if target_weight_position is None:
+                    return []
+
+                clean_target = {
+                    str(stock_id): float(weight)
+                    for stock_id, weight in dict(target_weight_position).items()
+                    if pd.notna(weight) and float(weight) > 0
+                }
+                if not clean_target:
+                    return []
+
+                current_stock = set(current.get_stock_list())
+                tradable_target: dict[str, float] = {}
+                locked_target: dict[str, float] = {}
+
+                for stock_id, weight in clean_target.items():
+                    trade_tradable = trade_exchange.is_stock_tradable(
+                        stock_id=stock_id,
+                        start_time=trade_start_time,
+                        end_time=trade_end_time,
+                    )
+                    pred_tradable = trade_exchange.is_stock_tradable(
+                        stock_id=stock_id,
+                        start_time=pred_start_time,
+                        end_time=pred_end_time,
+                    )
+                    if trade_tradable and pred_tradable:
+                        tradable_target[stock_id] = weight
+                    elif stock_id in current_stock:
+                        locked_target[stock_id] = weight
+
+                if tradable_target:
+                    tradable_weight_sum = float(sum(tradable_target.values()))
+                    locked_weight_sum = float(sum(locked_target.values()))
+                    residual_weight = max(1.0 - locked_weight_sum, 0.0)
+                    if tradable_weight_sum > 0 and residual_weight > 0:
+                        tradable_target = {
+                            stock_id: weight / tradable_weight_sum * residual_weight
+                            for stock_id, weight in tradable_target.items()
+                        }
+
+                adjusted_target = {**locked_target, **tradable_target}
+                total_weight = float(sum(adjusted_target.values()))
+                if total_weight <= 0:
+                    return []
+                adjusted_target = {stock_id: weight / total_weight for stock_id, weight in adjusted_target.items()}
+
+                return super().generate_order_list_from_target_weight_position(
+                    current=current,
+                    trade_exchange=trade_exchange,
+                    target_weight_position=adjusted_target,
+                    risk_degree=risk_degree,
+                    pred_start_time=pred_start_time,
+                    pred_end_time=pred_end_time,
+                    trade_start_time=trade_start_time,
+                    trade_end_time=trade_end_time,
+                )
+
+        class _PrecomputedWeightStrategy(WeightStrategyBase):
+            def __init__(self, **kwargs):
+                super().__init__(order_generator_cls_or_obj=_RedistributingOrderGenWOInteract(), **kwargs)
+
+            def generate_target_weight_position(self, score, current, trade_start_time, trade_end_time):
+                if score is None:
+                    return {}
+                if isinstance(score, pd.Series):
+                    weight_s = pd.to_numeric(score, errors="coerce")
+                else:
+                    score = score.copy()
+                    if "weight" in score.columns:
+                        weight_s = pd.to_numeric(score["weight"], errors="coerce")
+                    elif "risk_parity_weight" in score.columns:
+                        weight_s = pd.to_numeric(score["risk_parity_weight"], errors="coerce")
+                    elif "score" in score.columns:
+                        weight_s = pd.to_numeric(score["score"], errors="coerce")
+                    else:
+                        weight_s = pd.to_numeric(score.iloc[:, 0], errors="coerce")
+                weight_s = weight_s.replace([np.inf, -np.inf], np.nan).dropna()
+                weight_s = weight_s[weight_s > 0]
+                if weight_s.empty:
+                    return {}
+                total = float(weight_s.sum())
+                if total <= 0:
+                    return {}
+                weight_s = weight_s / total
+                return {str(k): float(v) for k, v in weight_s.items() if pd.notna(v) and v > 0}
+
+        return _PrecomputedWeightStrategy(signal=signal, risk_degree=risk_degree)
+
+
+RiskParityWeightStrategy = PrecomputedWeightStrategy
+
+
 def _apply_price_cap_to_trade_signal(trade_signal: pd.DataFrame, price_cap: float = 50.0) -> pd.DataFrame:
     """Exclude instruments whose close price is above the cap on the trade date."""
     if trade_signal.empty:
@@ -1180,11 +1650,17 @@ def _apply_price_cap_to_trade_signal(trade_signal: pd.DataFrame, price_cap: floa
 
     from qlib.data import D
 
+    value_cols = [c for c in trade_signal.columns]
     df = trade_signal.reset_index().copy()
     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     df["instrument"] = df["instrument"].astype(str)
-    df["score"] = pd.to_numeric(df["score"], errors="coerce")
-    df = df.dropna(subset=["datetime", "instrument", "score"])
+    if "score" in df.columns:
+        df["score"] = pd.to_numeric(df["score"], errors="coerce")
+    for col in value_cols:
+        if col != "volatility_60d":
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    required_cols = ["datetime", "instrument"] + (["score"] if "score" in df.columns else [])
+    df = df.dropna(subset=required_cols)
     if df.empty:
         return trade_signal.iloc[0:0]
 
@@ -1217,7 +1693,8 @@ def _apply_price_cap_to_trade_signal(trade_signal: pd.DataFrame, price_cap: floa
 
     merged = merged.drop(columns=["close"]).drop_duplicates(subset=["datetime", "instrument"], keep="last")
     merged = merged.sort_values(["datetime", "instrument"])
-    merged = merged.set_index(["datetime", "instrument"])[["score"]]
+    keep_cols = [c for c in value_cols if c in merged.columns]
+    merged = merged.set_index(["datetime", "instrument"])[keep_cols]
     merged.index = merged.index.set_names(["datetime", "instrument"])
     return merged
 
@@ -1232,19 +1709,17 @@ def _write_full_backtest_report(
     hold_num: int,
 ) -> None:
     from qlib.contrib.evaluate import backtest_daily
-    from qlib.contrib.strategy.signal_strategy import TopkDropoutStrategy
     from qlib.config import C
     import qlib
     import importlib
 
-    # Use raw stage2 fold predictions only.
-    signal_df = _build_full_signal(fold_outputs)
+    raw_signal_df = _build_full_signal(fold_outputs)
     full_dir = output_root / "full_backtest"
     full_dir.mkdir(parents=True, exist_ok=True)
     analysis_root.mkdir(parents=True, exist_ok=True)
     report_txt = analysis_root / "report_of_backtest.txt"
 
-    if signal_df.empty:
+    if raw_signal_df.empty:
         report_txt.write_text("No signal data available for full-cycle backtest.", encoding="utf-8")
         return
 
@@ -1269,7 +1744,7 @@ def _write_full_backtest_report(
     )
     account = float(os.environ.get("CASH_TOTAL", 100000))
 
-    raw_signal_series = signal_df["score"].sort_index()
+    raw_signal_series = raw_signal_df["score"].sort_index()
     signal_start = raw_signal_series.index.get_level_values("datetime").min()
     signal_end = raw_signal_series.index.get_level_values("datetime").max()
 
@@ -1281,51 +1756,50 @@ def _write_full_backtest_report(
     end_pos = int(cal.searchsorted(signal_end, side="right")) - 1
     backtest_end = pd.Timestamp(cal[min(end_pos + 5, len(cal) - 1)])
 
-    weekly_dates = (
-        signal_df.reset_index()[["datetime"]]
-        .drop_duplicates()
-        .assign(
-            iso_year=lambda x: pd.to_datetime(x["datetime"]).dt.isocalendar().year,
-            iso_week=lambda x: pd.to_datetime(x["datetime"]).dt.isocalendar().week,
-        )
-        .groupby(["iso_year", "iso_week"], as_index=False)["datetime"]
-        .max()["datetime"]
-    )
-    weekly_signal = signal_df.reset_index().copy()
-    weekly_signal = weekly_signal[weekly_signal["datetime"].isin(set(pd.to_datetime(weekly_dates)))]
+    price_cap = _get_price_cap()
+    full_backtest_strategy = str(os.environ.get("FULL_BACKTEST_STRATEGY", "stage36_risk_parity") or "stage36_risk_parity").strip().lower()
 
-    shifted = weekly_signal.copy()
-    trade_dates = []
-    for dt in pd.to_datetime(shifted["datetime"]):
-        pos = int(cal.searchsorted(dt, side="right"))
-        trade_dates.append(pd.Timestamp(cal[pos]) if pos < len(cal) else pd.NaT)
-    shifted["trade_datetime"] = trade_dates
-    shifted = shifted.dropna(subset=["trade_datetime"])
-    shifted = shifted.drop(columns=["datetime"]).rename(columns={"trade_datetime": "datetime"})
-    shifted = shifted.drop_duplicates(subset=["datetime", "instrument"], keep="last")
-    shifted_signal = shifted.set_index(["datetime", "instrument"])[["score"]].sort_index()
-    shifted_signal = _apply_price_cap_to_trade_signal(shifted_signal, price_cap=50.0)
+    if full_backtest_strategy == "buffered_equal_weight_topk":
+        shifted_signal = _build_buffered_equal_weight_signal(
+            raw_signal_df,
+            cal=cal,
+            hold_num=hold_num,
+            price_cap=price_cap,
+            dropout_buffer_pct=float(os.environ.get("FULL_BACKTEST_BUFFER_PCT", "0.5") or 0.5),
+        )
+        signal_source = "raw_stage2_score_buffered_topk"
+        portfolio_construction = (
+            f"Top{hold_num} equal-weight target position; sell only after falling out of top {int(float(os.environ.get('FULL_BACKTEST_BUFFER_PCT', '0.5') or 0.5) * 100)}% of cross-sectional score rank"
+        )
+        risk_degree = 1.0
+    else:
+        replay_signal_df = _build_stage36_full_signal(fold_outputs, output_root, hold_num)
+        portfolio_signal_df = replay_signal_df if not replay_signal_df.empty else _build_risk_parity_signal_from_raw_signal(raw_signal_df, hold_num=hold_num)
+        signal_source = "stage36_replay_risk_parity" if not replay_signal_df.empty else "raw_stage2_risk_parity_fallback"
+        shifted_signal = _shift_signal_to_next_trade_dates(portfolio_signal_df, cal)
+        shifted_signal = _apply_price_cap_to_trade_signal(shifted_signal, price_cap=price_cap)
+        if not shifted_signal.empty and "weight" not in shifted_signal.columns:
+            shifted_signal = shifted_signal.copy()
+            shifted_signal["weight"] = shifted_signal["score"]
+        portfolio_construction = "Risk Parity weighted target position"
+        risk_degree = 0.95
+
     if shifted_signal.empty:
         report_txt.write_text(
-            "Signal data exists, but no eligible trade dates remain after applying the price cap.",
+            "Signal data exists, but no eligible trade dates remain after applying the backtest selection rules.",
             encoding="utf-8",
         )
         return
-    signal_series = shifted_signal["score"]
+
     weekly_signal = shifted_signal.reset_index().copy()
+    raw_signal_df.reset_index().to_csv(full_dir / "signal_raw.csv", index=False, encoding="utf-8-sig")
     weekly_signal.to_csv(full_dir / "signal.csv", index=False, encoding="utf-8-sig")
     shifted_signal.reset_index().to_csv(full_dir / "trade_signal.csv", index=False, encoding="utf-8-sig")
     signal_diag = _signal_coverage_diagnostics(shifted_signal, cal)
     trade_start = shifted_signal.index.get_level_values("datetime").min()
     trade_end = shifted_signal.index.get_level_values("datetime").max()
 
-    strategy = TopkDropoutStrategy(
-        signal=signal_series,
-        topk=hold_num,
-        n_drop=1,         # ⑤ reduce churn: replace at most 1 stock per day
-        hold_thresh=1,
-        only_tradable=True,  # ⑤ skip limit-up/down and suspended stocks
-    )
+    strategy = PrecomputedWeightStrategy.create(signal=shifted_signal, risk_degree=risk_degree)
 
     report_normal, _positions_normal = backtest_daily(
         start_time=trade_start,
@@ -1429,6 +1903,8 @@ def _write_full_backtest_report(
         f"Backtest end: {backtest_end.date()}",
         f"Account: {account:.2f}",
         f"Benchmark: {benchmark}",
+        f"Signal source: {signal_source}",
+        f"Portfolio construction: {portfolio_construction}",
         f"Trade signal dates: {int(signal_diag['trade_signal_dates'])}",
         f"Calendar days in span: {int(signal_diag['calendar_days'])}",
         f"Signal coverage ratio: {signal_diag['signal_coverage_ratio']:.6f}",

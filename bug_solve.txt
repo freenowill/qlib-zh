@@ -1,0 +1,100 @@
+run_alpha158_small 已解决 bug 记录（2026-04-22）
+
+1. bug：run_alpha158_small 直接转发到 run_alpha158_practice
+	- 现象：small 的修改会污染 practice；small 无法形成独立入口。
+	- 影响：工程边界混乱，难以做 csi1000 专属优化。
+	- 修复：将 run_alpha158_small 改为独立入口脚本，单独管理参数、stage 和模板。
+
+2. bug：small 场景下仍可能复用 csi300 模板训练
+	- 现象：stage2 底层 MODEL_SPECS 默认来自 practice 版本，可能使用非 csi1000 模板。
+	- 影响：训练宇宙与目标市场不一致，导致结果不纯。
+	- 修复：新增 scripts/small/run_stage2_walk_forward_small.py，强制将 MODEL_SPECS 替换为 csi1000 专用模板。
+
+3. bug：stage1 早期实现中 instruments 代码格式被破坏
+	- 现象：曾出现将 SH/SZ 前缀剥离后写回 instruments 的问题。
+	- 影响：Qlib 无法正确匹配 features 目录与 instruments，造成 stage2 数据集为空或严重缺失。
+	- 修复：small 专用 stage1 改为直接复制原始 instruments/*.txt，保留原始 SH/SZ 编码。
+
+4. bug：small 场景错误继承了创业板/科创板过滤逻辑
+	- 现象：practice stage1 默认排除 300/301/688/689 前缀。
+	- 影响：对 csi1000 不合理，会无意删掉大量小盘股票，破坏目标投资域。
+	- 修复：small 专用 stage1 不再沿用该过滤逻辑，保持 csi1000 原始成分完整性。
+
+5. bug：stage2 smoke test 无法快速验证单 fold
+	- 现象：每次验证都跑完整 fold，耗时大。
+	- 影响：调试低效，难以快速定位问题。
+	- 修复：加入 STAGE2_MAX_FOLDS 环境变量，允许只跑最近 N 个 fold 做 smoke test。
+
+6. bug：small provider_uri 与 practice provider_uri 可能混用
+	- 现象：small 运行时容易落到 cn_data 或 cn_data_filter，而不是独立 small 数据目录。
+	- 影响：实验可复现性差，small 与 practice 数据视图不一致。
+	- 修复：small 模板统一绑定 /root/.qlib/qlib_data/cn_data_filter_small。
+
+7. bug：scores.csv 的 universe 容易被误解为“筛选后才是 csi1000”
+	- 现象：用户担心 stage2 输出混入非 csi1000 股票。
+	- 影响：影响对模型训练域和预测域的一致性判断。
+	- 修复：核验后确认本次 scores.csv 的 outside_csi1000 = 0，仅有 2 只有效成分因数据原因未出分；说明 stage2 预测池本身就是 csi1000。
+
+8. bug：annual walk-forward fold 数少但不透明
+	- 现象：用户执行全流程时，stage2 只有 2 folds，容易误判为程序异常。
+	- 影响：对 walk-forward 参数理解偏差。
+	- 修复：已定位根因：
+	  - train = 5y
+	  - valid = 2y
+	  - test = 3y
+	  - train_base_start = 2015-01-01
+	  在 annual mode 下理论上只能生成 2 个有效 folds，并非程序错误。
+
+9. bug：small 与 practice 共享脚本时难以定位问题来源
+	- 现象：一处修改后很难判断是 shared logic 问题还是 small 特定问题。
+	- 影响：排障效率低。
+	- 修复：small 侧新增独立 stage1 / stage2 脚本与独立模板，问题边界已经清晰。
+
+10. bug：stage2 full-cycle backtest 使用等权 TopK，和 stage5/6 的 Risk Parity 执行逻辑不一致
+	- 现象：full_backtest 过去使用 TopkDropoutStrategy，只按 score 排序后等权持仓。
+	- 影响：stage2 报告里的收益/回撤/换手，与真实落地到 stage5/6 后的组合结构存在系统性偏差。
+	- 修复：将 full-cycle backtest 改为使用预计算目标权重的 WeightStrategyBase 风格策略；优先采用 stage3~stage6 replay 的权重信号，回退时则采用 raw stage2 score + 60日波动率构造 Risk-Parity 风格权重。
+	- 结果：stage2 回测层与最终执行层的仓位分配逻辑明显更一致。
+
+11. bug：run_alpha158_small 的 full_backtest 与用户要求的“20只股票、低换手、尽量等金额”规则不一致
+	- 现象：旧实现要么走 Risk Parity，要么走 replay fallback，既不是 20 只股票固定持仓，也没有“跌出 csi1000 score 横截面前 50% 后才卖”的换手控制。
+	- 影响：full_backtest 结果无法直接代表用户定义的实盘执行逻辑。
+	- 修复：新增 `buffered_equal_weight_topk` 回测模式，按 raw stage2 score 构建 Top20 持仓，只有当旧持仓排名跌出全市场前 50% 时才移除，并用当前最高分股票补足到 20 只。
+	- 结果：full_backtest 的组合生成逻辑已与当前需求对齐。
+
+12. bug：buffered full_backtest 早期版本误把“前50%缓冲”实现成 `TopK × 1.5` 局部缓冲
+	- 现象：旧实现会在持仓跌出 `Top20 × 1.5 = Top30` 后就卖出，这比用户要求的“跌出 csi1000 score 排名前 50% 才卖”严格得多。
+	- 影响：换手率被显著放大，无法体现用户要求的低换手持有逻辑。
+	- 修复：缓冲阈值改为基于每日横截面总股票数计算，即 `ceil(universe_size × 50%)`，在 csi1000 场景下约等于前 500 名。
+	- 结果：换手控制逻辑已与“前50%全市场排名缓冲”定义一致。
+
+13. bug：权重策略遇到调仓日不可交易股票时，会直接丢失目标权重并留下现金
+	- 现象：无交互权重订单生成器会跳过调仓日不可交易且当前未持有的股票，但不会把这部分目标权重再分配给其它可交易目标。
+	- 影响：组合经常在调仓后保留过多现金，削弱“尽量等金额、少留现金”的执行目标。
+	- 修复：在 run_alpha158_small 使用的预计算权重策略中加入二次再分配逻辑，把不可交易新目标的权重重新归一到当日可交易的其它目标股票。
+	- 结果：full_backtest 的执行层现金拖累进一步下降，仓位利用率更高。
+
+14. bug：small stage2 只使用 csi1000 单一路径训练，无法同时利用全市场样本与目标域样本
+	- 现象：原 small wrapper 只覆盖两套 csi1000 模板，导致 stage2 只能学习目标域内部结构，无法吸收全市场横截面的稳定因子关系。
+	- 影响：模型在 regime 变化时鲁棒性不足，且“全市场先学结构、目标域再聚焦排序”的双路建模思想无法落地。
+	- 修复：引入 all-market + csi1000 双路基础模型，并在融合层按 route / model 两级 validation IC 做非负权重融合。
+	- 结果：stage2 已具备双路模型融合架构，同时最终导出预测仍锚定 csi1000 交易域。
+
+15. bug：若直接把 all-market 预测与 csi1000 预测做外连接，最终输出会混入非 csi1000 股票
+	- 现象：全市场模型的预测索引天然大于 csi1000 模型；简单 outer join 后，ensemble 容易把全市场独有股票也带入最终 `scores.csv`。
+	- 影响：最终交易宇宙会被污染，破坏 run_alpha158_small 的目标市场约束。
+	- 修复：融合时以 `universe_role=target` 的 csi1000 路模型索引为锚点，只在该索引上承接 all-market 路辅助信号。
+	- 结果：双路训练已实现，但最终输出和 full_backtest 仍保持纯 csi1000 宇宙。
+
+16. bug：allmarket_xgboost 在全量 stage2 中资源占用过高，导致训练进程被 SIGKILL
+	- 现象：在 `2026-04-24-csi1000` 实验中，第一折 `allmarket_xgboost` 训练阶段被系统直接杀掉，stage2 无法完成。
+	- 影响：dual-route 架构虽已接通，但工程上不可稳定跑完，无法得到完整 walk-forward 汇总。
+	- 修复：先停用 `allmarket_xgboost`，保留 `csi1000_xgboost`、`csi1000_lightgbm`、`allmarket_lightgbm` 三模型结构。
+	- 结果：保留目标域 + 全市场辅助信息，同时显著降低 stage2 资源压力。
+
+
+仍建议后续继续关注的潜在问题：
+1. stage2 已支持 Risk Parity 前移，但当 stage3~stage6 replay 不可用时仍会进入 raw_stage2_risk_parity_fallback，而不是完全复刻 stage5/6 的全部基本面过滤；
+2. stage4 逐只抓取 baostock 性能较慢；
+3. 未显式输出 dropped_instruments 诊断文件；
+4. annual / weekly 模式切换目前仍主要依赖环境变量配置。
