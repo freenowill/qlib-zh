@@ -19,7 +19,10 @@ from pathlib import Path
 
 import pandas as pd
 
-from gm_client import GmClient
+try:
+    from gm_client import GmClient
+except Exception:  # pragma: no cover - environment dependent
+    GmClient = None  # type: ignore[assignment]
 
 warnings.filterwarnings("ignore")
 
@@ -328,11 +331,13 @@ def _avg_turnover(gm: GmClient | None, codes: set[str], pred_date: str, days: in
 def first_screen(pred_dir: str, output_dir: str, pred_date: str, top_n: int = 20, max_price: float = 50.0, market: str = "csi300"):
     gm = None
     gm_token = os.getenv("GM_TOKEN", "").strip()
-    if gm_token:
+    if gm_token and GmClient is not None:
         try:
             gm = GmClient(gm_token)
         except Exception as exc:
             print(f"  ⚠ gm 初始化失败，切换到本地 Qlib 数据: {exc}")
+    elif gm_token and GmClient is None:
+        print("  ⚠ gm_client 不可用，切换到本地 Qlib 数据")
     pred_path = Path(pred_dir)
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)

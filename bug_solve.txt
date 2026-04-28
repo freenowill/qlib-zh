@@ -92,6 +92,18 @@ run_alpha158_small 已解决 bug 记录（2026-04-22）
 	- 修复：先停用 `allmarket_xgboost`，保留 `csi1000_xgboost`、`csi1000_lightgbm`、`allmarket_lightgbm` 三模型结构。
 	- 结果：保留目标域 + 全市场辅助信息，同时显著降低 stage2 资源压力。
 
+17. bug：run_alpha158_small 的 stage2 历史起点被硬编码在 2015，导致 2008~2014 样本无法进入 walk-forward
+	- 现象：small 入口默认 `TRAIN_BASE_START=2015-01-01`、`WALK_FORWARD_START_DATE=2015-01-01`，即使模板或脚本支持更早历史，也会在入口层直接截断。
+	- 影响：stage2 无法利用 2008-01-01 以来的更长历史；有效折叠数与跨周期训练覆盖被压缩。
+	- 修复：将 small 入口的历史起点统一前推到 2008-01-01，并修复 `gen_practice_yaml.py` 中 `data_start` 只更新顶层 `data_handler_config`、却没有同步到内联 handler kwargs 的问题。
+	- 结果：run_alpha158_small 的 stage2 现在可以从 2008-01-01 开始构造历史训练区间，动态 YAML 与模板默认值保持一致。
+
+18. bug：历史起点前推后，早期 fold 可能命中“训练时间合法但 universe 样本为空”的区间，导致 stage2 直接失败
+	- 现象：small 的 csi1000 fold 在 2016 年附近会生成 `train=2009~2014` 这类时间窗，但 csi1000 成分文件最早仅从 2014-10-31 开始，最终训练集为空并触发 `Empty data from dataset`。
+	- 影响：虽然入口层已支持更长历史，但 stage2 在第一折就会因空训练集报错，无法自动跳到后续有效折叠。
+	- 修复：在 `run_stage2_walk_forward.py` 中加入 universe 历史覆盖解析逻辑，基于 instruments 文件自动检测 train 窗口是否与真实样本覆盖有交集；无交集的 fold 在生成阶段即跳过。
+	- 结果：stage2 现在会自动丢弃早期空训练折叠，保留后续真正可训练的 folds。
+
 
 仍建议后续继续关注的潜在问题：
 1. stage2 已支持 Risk Parity 前移，但当 stage3~stage6 replay 不可用时仍会进入 raw_stage2_risk_parity_fallback，而不是完全复刻 stage5/6 的全部基本面过滤；

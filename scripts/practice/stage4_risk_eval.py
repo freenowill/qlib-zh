@@ -29,12 +29,14 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
+_LOGIN_FAILURE: Exception | None = None
+
 
 def _bs():
     try:
         return importlib.import_module("baostock")
     except Exception as exc:  # pragma: no cover - environment dependent
-        raise SystemExit(f"baostock 未安装或无法导入: {exc}") from exc
+        raise RuntimeError(f"baostock 未安装或无法导入: {exc}") from exc
 
 
 NEGATIVE_KEYWORDS = ("预亏", "预减", "亏损", "下滑", "下降", "减少", "低于", "转亏", "恶化")
@@ -474,12 +476,17 @@ def _build_fallback_result(pool: pd.DataFrame, pred_date: str) -> pd.DataFrame:
 
 
 def risk_eval(input_csv: str, output_dir: str, pred_date: str):
+    global _LOGIN_FAILURE
     login_error = None
-    try:
-        _login()
-    except Exception as exc:
-        login_error = exc
-        print(f"⚠ baostock 登录失败，stage4 切换到本地降级模式: {exc}")
+    if _LOGIN_FAILURE is not None:
+        login_error = _LOGIN_FAILURE
+    else:
+        try:
+            _login()
+        except Exception as exc:
+            _LOGIN_FAILURE = exc
+            login_error = exc
+            print(f"⚠ baostock 登录失败，stage4 切换到本地降级模式: {exc}")
 
     try:
         out_path = Path(output_dir)

@@ -76,6 +76,13 @@ export WALK_FORWARD_START_DATE="${WALK_FORWARD_START_DATE:-2008-01-01}"
 export WALK_FORWARD_END_DATE="${WALK_FORWARD_END_DATE:-}"
 export TRAIN_YEARS="${TRAIN_YEARS:-5}"
 export VALID_YEARS="${VALID_YEARS:-2}"
+export FULL_BACKTEST_STRATEGY="${FULL_BACKTEST_STRATEGY:-buffered_equal_weight_topk}"
+export FULL_BACKTEST_BUFFER_PCT="${FULL_BACKTEST_BUFFER_PCT:-0.5}"
+FULL_BACKTEST_BUFFER_PCT_INT=$(python3 - <<'PY'
+import os
+print(int(round(float(os.environ.get("FULL_BACKTEST_BUFFER_PCT", "0.5")) * 100)))
+PY
+)
 
 # ──────────────────────────────────────────────
 # 2. 日期计算（基于 T = 今天/本周五）
@@ -199,6 +206,8 @@ echo "  回看(年)   : $WALK_FORWARD_HISTORY_YEARS"
 echo "  滚动起点   : $WALK_FORWARD_START_DATE"
 echo "  滚动终点   : $WALK_FORWARD_END_DATE"
 echo "  分段(年)   : $WALK_FORWARD_SEGMENT_YEARS"
+echo "  full bt    : $FULL_BACKTEST_STRATEGY"
+echo "  卖出缓冲   : top ${FULL_BACKTEST_BUFFER_PCT_INT}% 保留"
 echo "  stage      : $START_STAGE → $END_STAGE"
 echo "  output     : $OUT_DIR"
 echo "============================================================"
@@ -280,6 +289,8 @@ run_stage2() {
       -e WALK_FORWARD_SEGMENT_YEARS \
       -e WALK_FORWARD_START_DATE \
       -e WALK_FORWARD_END_DATE \
+      -e FULL_BACKTEST_STRATEGY \
+      -e FULL_BACKTEST_BUFFER_PCT \
       -v "$SCRIPT_DIR:$WORKDIR_IN_CONTAINER" \
       -v "$QDATA_HOST_DIR:/root/.qlib" \
       -w "$WORKDIR_IN_CONTAINER" \

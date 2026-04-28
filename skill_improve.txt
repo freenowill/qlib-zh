@@ -93,3 +93,16 @@ run_alpha158_small 优化记录（2026-04-22）
 
 
 
+13. 将 run_alpha158_small 的 stage2 历史样本起点前推到 2008-01-01
+	- 优化内容：统一把 small 入口的 `TRAIN_BASE_START` 与 `WALK_FORWARD_START_DATE` 从 2015-01-01 前推到 2008-01-01，并同步修正 `gen_practice_yaml.py`，让 `--data-start` 能真实透传到内联 handler kwargs，而不是只改到顶层 YAML。
+	- 配套动作：small 的 csi1000 / all-market 模板的 `data_handler_config.start_time` 与 `fit_start_time` 也一并前推到 2008-01-01，保证模板默认值与动态生成逻辑一致。
+	- 收益：stage2 walk-forward 可以使用更长的历史区间构造训练折叠，早期样本不再被 2015 截断，因子稳定性与多周期检验能力更强。
+
+14. 在 fold 生成阶段自动跳过“训练集为空”的早期折叠
+	- 优化内容：在 stage2 的 fold 生成前，自动解析当前模板对应 universe 的 instruments 文件，提取可交易样本覆盖区间；若某个 fold 的 train 窗口与 universe 历史覆盖完全无交集，则直接跳过，不再进入训练。
+	- 适用场景：例如 csi1000 成分历史从 2014-10-31 才开始，但 walk-forward 起点被前推到 2008-01-01 时，2016 以前的早期 fold 很容易出现“训练窗合法、但 universe 样本为空”的情况。
+	- 收益：fold 计划会自动贴合真实样本覆盖范围，避免空数据训练报错，同时保留更长历史入口带来的后续有效 fold。
+
+
+
+

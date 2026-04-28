@@ -96,6 +96,104 @@ def _load_template(template_path: Path) -> dict:
         return yaml.safe_load(f)
 
 
+def _resolve_provider_dir(template_cfg: dict) -> Path | None:
+    qlib_init = template_cfg.get("qlib_init", {}) if isinstance(template_cfg, dict) else {}
+    provider_uri = qlib_init.get("provider_uri")
+    if not provider_uri:
+        return None
+    provider_uri = str(provider_uri).strip()
+    if not provider_uri:
+        return None
+
+    parsed = urlparse(provider_uri)
+    if parsed.scheme == "file":
+        path = Path(parsed.path)
+    else:
+        path = Path(provider_uri).expanduser()
+    return path
+
+
+def _resolve_instrument_name(template_cfg: dict) -> str | None:
+    dataset_kwargs = (
+        template_cfg.get("task", {})
+        .get("dataset", {})
+        .get("kwargs", {})
+    )
+    handler_kwargs = dataset_kwargs.get("handler", {}).get("kwargs", {})
+    instrument_name = handler_kwargs.get("instruments")
+    if instrument_name is None:
+        instrument_name = template_cfg.get("data_handler_config", {}).get("instruments")
+    if instrument_name is None:
+        instrument_name = template_cfg.get("market")
+    if instrument_name is None:
+        return None
+    return str(instrument_name).strip()
+
+
+def _load_instrument_intervals(template_cfg: dict) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    provider_dir = _resolve_provider_dir(template_cfg)
+    instrument_name = _resolve_instrument_name(template_cfg)
+    if provider_dir is None or not instrument_name:
+        return []
+
+    instrument_file = provider_dir / "instruments" / f"{instrument_name}.txt"
+    if not instrument_file.exists() and instrument_name.lower() == "all":
+        instrument_file = provider_dir / "instruments" / "all.txt"
+    if not instrument_file.exists():
+        return []
+
+    intervals: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    with open(instrument_file, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 3:
+                continue
+            try:
+                start = pd.Timestamp(parts[-2])
+                end = pd.Timestamp(parts[-1])
+            except Exception:
+                continue
+            if pd.isna(start) or pd.isna(end):
+                continue
+            intervals.append((start.normalize(), end.normalize()))
+
+    if not intervals:
+        return []
+
+    intervals.sort(key=lambda item: (item[0], item[1]))
+    merged: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    for start, end in intervals:
+        if not merged:
+            merged.append((start, end))
+            continue
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end + pd.Timedelta(days=1):
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _window_has_any_coverage(
+    start_date: str | pd.Timestamp,
+    end_date: str | pd.Timestamp,
+    intervals: list[tuple[pd.Timestamp, pd.Timestamp]] | None,
+) -> bool:
+    if not intervals:
+        return True
+    start_ts = pd.Timestamp(start_date).normalize()
+    end_ts = pd.Timestamp(end_date).normalize()
+    if end_ts < start_ts:
+        return False
+    for cov_start, cov_end in intervals:
+        if cov_end < start_ts:
+            continue
+        if cov_start > end_ts:
+            break
+        return True
+    return False
+
+
 def _load_pickle(path: Path):
     with open(path, "rb") as f:
         return pickle.load(f)
@@ -436,6 +534,7 @@ def _build_fold_dates(
     valid_years: int = 2,
     train_base_start: str = "2008-01-01",
     history_years: int | None = None,
+    train_coverage_intervals: list[tuple[pd.Timestamp, pd.Timestamp]] | None = None,
 ) -> list[dict[str, str]]:
     """Build walk-forward folds aligned to the trading calendar.
 
@@ -518,6 +617,10 @@ def _build_fold_dates(
                 continue
             train_start = pd.Timestamp(calendar[train_start_idx])
 
+            if not _window_has_any_coverage(train_start, train_end, train_coverage_intervals):
+                t_end -= pd.DateOffset(years=step_years)
+                continue
+
             items.append(
                 {
                     "signal_date": _fmt(signal_date),
@@ -581,6 +684,9 @@ def _build_fold_dates(
             if train_start_idx > train_end_idx:
                 continue
             train_start = pd.Timestamp(calendar[train_start_idx])
+
+            if not _window_has_any_coverage(train_start, train_end, train_coverage_intervals):
+                continue
 
             items.append(
                 {
@@ -1141,6 +1247,68 @@ def _signal_coverage_diagnostics(trade_signal: pd.DataFrame, calendar: pd.Dateti
     }
 
 
+def _holding_count_diagnostics(trade_signal: pd.DataFrame) -> dict[str, float]:
+    if trade_signal.empty:
+        return {
+            "avg_holdings": float("nan"),
+            "median_holdings": float("nan"),
+            "min_holdings": float("nan"),
+            "max_holdings": float("nan"),
+        }
+
+    counts = (
+        trade_signal.reset_index()
+        .groupby("datetime")["instrument"]
+        .nunique()
+        .astype(float)
+    )
+    return {
+        "avg_holdings": float(counts.mean()),
+        "median_holdings": float(counts.median()),
+        "min_holdings": float(counts.min()),
+        "max_holdings": float(counts.max()),
+    }
+
+
+def _backtest_validity_diagnostics(report_df: pd.DataFrame, account: float, trade_signal: pd.DataFrame) -> dict[str, object]:
+    issues: list[str] = []
+    if report_df is None or report_df.empty:
+        issues.append("backtest report is empty")
+        return {
+            "is_valid": False,
+            "issues": issues,
+            "executed_trade_days": 0,
+            "invested_days": 0,
+            "max_invested_value": float("nan"),
+        }
+
+    rpt = report_df.copy()
+    for col in ["turnover", "value", "cash"]:
+        if col not in rpt.columns:
+            rpt[col] = 0.0
+        rpt[col] = pd.to_numeric(rpt[col], errors="coerce").fillna(0.0)
+
+    executed_trade_days = int((rpt["turnover"] > 0).sum())
+    invested_days = int((rpt["value"] > 0).sum())
+    max_invested_value = float(rpt["value"].max()) if not rpt.empty else float("nan")
+    cash_never_deployed = bool((rpt["cash"] >= account - 1e-8).all())
+
+    if not trade_signal.empty and executed_trade_days == 0:
+        issues.append("signals exist but no executed trades were recorded")
+    if not trade_signal.empty and invested_days == 0:
+        issues.append("signals exist but portfolio market value never became positive")
+    if not trade_signal.empty and cash_never_deployed:
+        issues.append("cash was never deployed despite non-empty trade signals")
+
+    return {
+        "is_valid": len(issues) == 0,
+        "issues": issues,
+        "executed_trade_days": executed_trade_days,
+        "invested_days": invested_days,
+        "max_invested_value": max_invested_value,
+    }
+
+
 def _fold_pred_date(fold_output: Path) -> str | None:
     scores_csv = fold_output / "scores.csv"
     if not scores_csv.exists():
@@ -1155,11 +1323,204 @@ def _fold_pred_date(fold_output: Path) -> str | None:
     return None
 
 
+def _to_qlib_instrument(value: object) -> str | None:
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return None
+    if text.upper().startswith(("SH", "SZ")) and "." not in text:
+        prefix = text[:2].upper()
+        digits = text[2:]
+        if digits.isdigit():
+            return f"{prefix}{digits.zfill(6)}"
+    if "." in text:
+        left, right = text.split(".", 1)
+        if left.upper() in {"SHSE", "XSHG", "SH"} and right.isdigit():
+            return f"SH{right.zfill(6)}"
+        if left.upper() in {"SZSE", "XSHE", "SZ"} and right.isdigit():
+            return f"SZ{right.zfill(6)}"
+        if right.upper() in {"SH", "XSHG"} and left.isdigit():
+            return f"SH{left.zfill(6)}"
+        if right.upper() in {"SZ", "XSHE"} and left.isdigit():
+            return f"SZ{left.zfill(6)}"
+    digits = text[2:] if text.upper().startswith(("SH", "SZ")) and text[2:].isdigit() else text
+    if not str(digits).isdigit():
+        return None
+    digits = str(digits).zfill(6)
+    prefix = "SH" if digits.startswith(("5", "6", "9")) else "SZ"
+    return f"{prefix}{digits}"
+
+
+def _resolve_result_update_instrument(frame: pd.DataFrame) -> pd.Series:
+    normalized = pd.Series(index=frame.index, dtype=object)
+    for col in ["instrument", "symbol", "code"]:
+        if col not in frame.columns:
+            continue
+        mapped = frame[col].map(_to_qlib_instrument)
+        normalized = normalized.where(normalized.notna(), mapped)
+    return normalized
+
+
+def _select_weekly_signal_dates(datetimes: pd.Series | pd.Index) -> list[pd.Timestamp]:
+    if len(datetimes) == 0:
+        return []
+
+    dt_index = pd.DatetimeIndex(pd.to_datetime(datetimes, errors="coerce")).dropna().sort_values().unique()
+    if len(dt_index) == 0:
+        return []
+
+    weekly_dates = (
+        pd.DataFrame({"datetime": dt_index})
+        .assign(
+            iso_year=lambda x: pd.to_datetime(x["datetime"]).dt.isocalendar().year,
+            iso_week=lambda x: pd.to_datetime(x["datetime"]).dt.isocalendar().week,
+        )
+        .groupby(["iso_year", "iso_week"], as_index=False)["datetime"]
+        .max()["datetime"]
+    )
+    return [pd.Timestamp(dt) for dt in pd.to_datetime(weekly_dates, errors="coerce").dropna().tolist()]
+
+
+def _load_fold_snapshot_metadata(fold_output: Path) -> dict[str, object]:
+    scores_csv = fold_output / "scores.csv"
+    if not scores_csv.exists():
+        return {}
+
+    try:
+        df = pd.read_csv(scores_csv)
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+
+    exclude_cols = {
+        "stock",
+        "code",
+        "instrument",
+        "date",
+        "datetime",
+        "pred_date",
+        "score",
+        "score_final",
+        "rank",
+        "percentile",
+        "rank_pct",
+        "score_quantile",
+        "quantile_bucket",
+    }
+    metadata: dict[str, object] = {}
+    for col in df.columns:
+        if col in exclude_cols:
+            continue
+        series = df[col].dropna()
+        if series.empty:
+            continue
+        try:
+            if series.astype(str).nunique(dropna=True) > 1:
+                continue
+        except Exception:
+            continue
+        metadata[col] = series.iloc[0]
+    return metadata
+
+
+def _build_replay_scores_snapshot(
+    date_scores: pd.DataFrame,
+    pred_date: str,
+    snapshot_metadata: dict[str, object] | None = None,
+) -> pd.DataFrame:
+    if date_scores.empty:
+        return pd.DataFrame()
+
+    out = date_scores.copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out["instrument"] = out["instrument"].astype(str)
+    out["score"] = pd.to_numeric(out["score"], errors="coerce")
+    out = out.dropna(subset=["datetime", "instrument", "score"])
+    if out.empty:
+        return pd.DataFrame()
+
+    out = out.sort_values(["score", "instrument"], ascending=[False, True]).reset_index(drop=True)
+    n = len(out)
+    out["rank"] = range(1, n + 1)
+    out["rank_pct"] = (out["rank"] / n * 100).round(2).astype(str) + "%"
+    out["pred_date"] = pred_date
+    out["date"] = pred_date
+    out["score_final"] = out["score"]
+    out["score_quantile"] = (1.0 - (out["rank"] - 1) / max(n, 1)).round(6)
+    out["percentile"] = out["score_quantile"]
+    out["quantile_bucket"] = np.select(
+        [
+            out["rank"] <= max(int(np.ceil(n * 0.01)), 1),
+            out["rank"] <= max(int(np.ceil(n * 0.05)), 1),
+            out["rank"] <= max(int(np.ceil(n * 0.10)), 1),
+        ],
+        ["top_1pct", "top_5pct", "top_10pct"],
+        default="others",
+    )
+    out["code"] = out["instrument"].astype(str).str.replace(r"^[A-Za-z]+", "", regex=True).str.zfill(6)
+    out["stock"] = out["code"]
+
+    for col, value in (snapshot_metadata or {}).items():
+        if col not in out.columns:
+            out[col] = value
+
+    preferred_cols = [
+        "stock",
+        "code",
+        "instrument",
+        "date",
+        "pred_date",
+        "score",
+        "rank",
+        "percentile",
+        "rank_pct",
+        "score_quantile",
+        "quantile_bucket",
+        "score_final",
+    ]
+    extra_cols = [c for c in out.columns if c not in {"datetime", *preferred_cols}]
+    return out[preferred_cols + extra_cols].copy()
+
+
+def _build_stage36_replay_plan(fold_outputs: list[Path]) -> list[dict[str, object]]:
+    replay_plan: dict[pd.Timestamp, dict[str, object]] = {}
+
+    for fold_output in fold_outputs:
+        fold_scores = _load_fold_scores(fold_output)
+        if fold_scores.empty:
+            continue
+        fold_scores = fold_scores.copy()
+        fold_scores["datetime"] = pd.to_datetime(fold_scores["datetime"], errors="coerce")
+        fold_scores = fold_scores.dropna(subset=["datetime", "instrument", "score"])
+        if fold_scores.empty:
+            continue
+
+        fold_tag = fold_output.parent.name
+        snapshot_metadata = _load_fold_snapshot_metadata(fold_output)
+        for signal_dt in _select_weekly_signal_dates(fold_scores["datetime"]):
+            date_slice = fold_scores[fold_scores["datetime"] == signal_dt].copy()
+            if date_slice.empty:
+                continue
+            replay_plan[pd.Timestamp(signal_dt)] = {
+                "fold_output": fold_output,
+                "fold_tag": fold_tag,
+                "pred_date": _fmt(pd.Timestamp(signal_dt)),
+                "scores_snapshot": _build_replay_scores_snapshot(
+                    date_slice,
+                    pred_date=_fmt(pd.Timestamp(signal_dt)),
+                    snapshot_metadata=snapshot_metadata,
+                ),
+            }
+
+    return [replay_plan[key] for key in sorted(replay_plan)]
+
+
 def _stage36_replay_signal_from_fold(
-    fold_output: Path,
+    pred_dir: Path,
     replay_dir: Path,
     pred_date: str,
     hold_num: int,
+    market: str,
 ) -> pd.DataFrame:
     """Replay stage3~stage6 for one fold and convert the final portfolio into a trade signal."""
     if str(ROOT) not in sys.path:
@@ -1176,10 +1537,17 @@ def _stage36_replay_signal_from_fold(
     stage6_dir = replay_dir / "stage6_final_result"
 
     # Run the downstream chain directly through callable functions.
-    first_screen(str(fold_output), str(stage3_dir), pred_date, top_n=20, max_price=float(os.environ.get("MAX_STOCK_PRICE", 50.0)))
+    first_screen(
+        str(pred_dir),
+        str(stage3_dir),
+        pred_date,
+        top_n=20,
+        max_price=float(os.environ.get("MAX_STOCK_PRICE", 50.0)),
+        market=market,
+    )
     risk_eval(str(stage3_dir / "first_screen.csv"), str(stage4_dir), pred_date)
-    second_screen(str(stage4_dir / "risk_eval.csv"), str(fold_output), str(stage5_dir), hold_num=hold_num)
-    final_result(str(stage5_dir / "second_screen.csv"), str(fold_output), str(stage6_dir), hold_num=hold_num)
+    second_screen(str(stage4_dir / "risk_eval.csv"), str(pred_dir), str(stage5_dir), hold_num=hold_num)
+    final_result(str(stage5_dir / "second_screen.csv"), str(pred_dir), str(stage6_dir), hold_num=hold_num)
 
     result_update_csv = stage6_dir / "result_update.csv"
     if not result_update_csv.exists():
@@ -1203,7 +1571,7 @@ def _stage36_replay_signal_from_fold(
     trade_dt = pd.to_datetime(pred_date)
     out = result_update.copy()
     out["datetime"] = trade_dt
-    out["instrument"] = out["code"].astype(str)
+    out["instrument"] = _resolve_result_update_instrument(out)
     out["score"] = pd.to_numeric(out[score_col], errors="coerce").fillna(0.0)
     out = out[["datetime", "instrument", "score"]].dropna(subset=["datetime", "instrument", "score"])
     return out
@@ -1213,26 +1581,32 @@ def _build_stage36_full_signal(
     fold_outputs: list[Path],
     output_root: Path,
     hold_num: int,
+    market: str,
 ) -> pd.DataFrame:
-    """Build a replay signal from stage3~stage6 outputs on each fold."""
+    """Build a weekly continuous replay signal from stage3~stage6 outputs."""
     replay_root = output_root / "full_backtest" / "stage36_replay"
     frames: list[pd.DataFrame] = []
 
-    for fold_output in fold_outputs:
-        pred_date = _fold_pred_date(fold_output)
-        if not pred_date:
+    for plan_item in _build_stage36_replay_plan(fold_outputs):
+        pred_date = str(plan_item["pred_date"])
+        fold_tag = str(plan_item["fold_tag"])
+        scores_snapshot = plan_item.get("scores_snapshot")
+        if not isinstance(scores_snapshot, pd.DataFrame) or scores_snapshot.empty:
             continue
-        fold_tag = fold_output.parent.name
-        replay_dir = replay_root / fold_tag
+        replay_dir = replay_root / fold_tag / pred_date
+        pred_dir = replay_dir / "model_predict"
+        pred_dir.mkdir(parents=True, exist_ok=True)
+        scores_snapshot.to_csv(pred_dir / "scores.csv", index=False, encoding="utf-8-sig")
         try:
             df = _stage36_replay_signal_from_fold(
-                fold_output=fold_output,
+                pred_dir=pred_dir,
                 replay_dir=replay_dir,
                 pred_date=pred_date,
                 hold_num=hold_num,
+                market=market,
             )
         except Exception as exc:
-            print(f"  ⚠ stage3~stage6 replay failed for fold {fold_tag}: {exc}")
+            print(f"  ⚠ stage3~stage6 weekly replay failed for {fold_tag} @ {pred_date}: {exc}")
             continue
         if not df.empty:
             frames.append(df)
@@ -1758,6 +2132,7 @@ def _write_full_backtest_report(
 
     price_cap = _get_price_cap()
     full_backtest_strategy = str(os.environ.get("FULL_BACKTEST_STRATEGY", "stage36_risk_parity") or "stage36_risk_parity").strip().lower()
+    target_market = str(os.environ.get("TARGET_MARKET") or _resolve_instrument_name(template_cfg) or "csi300").strip().lower()
 
     if full_backtest_strategy == "buffered_equal_weight_topk":
         shifted_signal = _build_buffered_equal_weight_signal(
@@ -1773,7 +2148,7 @@ def _write_full_backtest_report(
         )
         risk_degree = 1.0
     else:
-        replay_signal_df = _build_stage36_full_signal(fold_outputs, output_root, hold_num)
+        replay_signal_df = _build_stage36_full_signal(fold_outputs, output_root, hold_num, target_market)
         portfolio_signal_df = replay_signal_df if not replay_signal_df.empty else _build_risk_parity_signal_from_raw_signal(raw_signal_df, hold_num=hold_num)
         signal_source = "stage36_replay_risk_parity" if not replay_signal_df.empty else "raw_stage2_risk_parity_fallback"
         shifted_signal = _shift_signal_to_next_trade_dates(portfolio_signal_df, cal)
@@ -1827,6 +2202,9 @@ def _write_full_backtest_report(
     daily["excess_curve"] = (1 + daily["excess_return"]).cumprod()
     daily["drawdown"] = daily["equity_curve"] / daily["equity_curve"].cummax() - 1
     daily.to_csv(full_dir / "equity_curve.csv", encoding="utf-8-sig")
+
+    holding_diag = _holding_count_diagnostics(shifted_signal)
+    validity_diag = _backtest_validity_diagnostics(report_normal, account, shifted_signal)
 
     # ── Qlib native report figures ────────────────────────────────────────
     native_report_figs: list = []
@@ -1896,7 +2274,7 @@ def _write_full_backtest_report(
     )
 
     summary_lines = [
-        f"Full-cycle Top{hold_num} walk-forward backtest",
+        f"Full-cycle Up-to-Top{hold_num} walk-forward backtest",
         "====================================",
         f"Signals: {signal_start.date()} -> {signal_end.date()}",
         f"Trade signals: {trade_start.date()} -> {trade_end.date()}",
@@ -1905,11 +2283,18 @@ def _write_full_backtest_report(
         f"Benchmark: {benchmark}",
         f"Signal source: {signal_source}",
         f"Portfolio construction: {portfolio_construction}",
+        f"Backtest validity: {'VALID' if validity_diag['is_valid'] else 'INVALID'}",
         f"Trade signal dates: {int(signal_diag['trade_signal_dates'])}",
         f"Calendar days in span: {int(signal_diag['calendar_days'])}",
         f"Signal coverage ratio: {signal_diag['signal_coverage_ratio']:.6f}",
         f"Median gap between signal dates: {signal_diag['median_gap_days']:.2f} trading days",
         f"Max gap between signal dates: {signal_diag['max_gap_days']:.2f} trading days",
+        f"Average holdings per signal date: {holding_diag['avg_holdings']:.2f}",
+        f"Median holdings per signal date: {holding_diag['median_holdings']:.2f}",
+        f"Min/Max holdings per signal date: {holding_diag['min_holdings']:.0f} / {holding_diag['max_holdings']:.0f}",
+        f"Executed trade days: {int(validity_diag['executed_trade_days'])}",
+        f"Invested days: {int(validity_diag['invested_days'])}",
+        f"Max invested market value: {float(validity_diag['max_invested_value']):.2f}",
         f"Mean turnover: {metrics['turnover_mean']:.6f}",
         f"Total turnover: {metrics['turnover_sum']:.6f}",
         f"Annualized return: {metrics['annualized_return']:.6f}",
@@ -1923,8 +2308,17 @@ def _write_full_backtest_report(
         "",
     ]
 
+    if not validity_diag["is_valid"]:
+        summary_lines.extend([f"Validity issue: {issue}" for issue in validity_diag["issues"]])
+        summary_lines.append("")
+
     # Lightweight expert-style commentaries for fast inspection.
-    if pd.notna(signal_diag["signal_coverage_ratio"]) and signal_diag["signal_coverage_ratio"] < 0.2:
+    if not validity_diag["is_valid"]:
+        commentary = (
+            "Backtest execution is invalid for performance interpretation: signals were generated, but the simulated "
+            "portfolio did not establish effective positions. Check instrument mapping, tradability filters, and order execution settings."
+        )
+    elif pd.notna(signal_diag["signal_coverage_ratio"]) and signal_diag["signal_coverage_ratio"] < 0.2:
         commentary = (
             "Signal coverage is sparse relative to the trading calendar; the full-cycle backtest should be interpreted "
             "as a sparse-signal replay rather than a fully continuous daily portfolio."
@@ -1983,7 +2377,7 @@ def _write_full_backtest_report(
   </style>
 </head>
 <body>
-    <h1>Full-cycle Top{hold_num} Walk-forward Backtest</h1>
+    <h1>Full-cycle Up-to-Top{hold_num} Walk-forward Backtest</h1>
         <div class="muted">Aggregated from fold-level OOS predictions. This page now uses Qlib native report graphs.</div>
     <div class="card">
         <h2>Metrics</h2>
@@ -1992,6 +2386,16 @@ def _write_full_backtest_report(
         </table>
     </div>
         <div class="card">
+                <h2>Backtest validity</h2>
+                <table>
+                        <tr><th>status</th><td>{'VALID' if validity_diag['is_valid'] else 'INVALID'}</td></tr>
+                        <tr><th>executed_trade_days</th><td>{int(validity_diag['executed_trade_days'])}</td></tr>
+                        <tr><th>invested_days</th><td>{int(validity_diag['invested_days'])}</td></tr>
+                        <tr><th>max_invested_value</th><td>{float(validity_diag['max_invested_value']):.2f}</td></tr>
+                        <tr><th>issues</th><td>{'; '.join(validity_diag['issues']) if validity_diag['issues'] else 'none'}</td></tr>
+                </table>
+        </div>
+        <div class="card">
                 <h2>Signal coverage diagnostics</h2>
                 <table>
                         <tr><th>trade_signal_dates</th><td>{int(signal_diag['trade_signal_dates'])}</td></tr>
@@ -1999,6 +2403,10 @@ def _write_full_backtest_report(
                         <tr><th>signal_coverage_ratio</th><td>{signal_diag['signal_coverage_ratio']:.6f}</td></tr>
                         <tr><th>median_gap_days</th><td>{signal_diag['median_gap_days']:.2f}</td></tr>
                         <tr><th>max_gap_days</th><td>{signal_diag['max_gap_days']:.2f}</td></tr>
+                        <tr><th>avg_holdings</th><td>{holding_diag['avg_holdings']:.2f}</td></tr>
+                        <tr><th>median_holdings</th><td>{holding_diag['median_holdings']:.2f}</td></tr>
+                        <tr><th>min_holdings</th><td>{holding_diag['min_holdings']:.0f}</td></tr>
+                        <tr><th>max_holdings</th><td>{holding_diag['max_holdings']:.0f}</td></tr>
                 </table>
         </div>
     {''.join(sections_html)}
@@ -2093,6 +2501,7 @@ def main() -> None:
         start_date=args.train_base_start,
         end_date=walk_forward_end,
     )
+    train_coverage_intervals = _load_instrument_intervals(template_cfg)
     calendar_end = pd.Timestamp(calendar.max())
     requested_end = pd.Timestamp(walk_forward_end)
     effective_end = min(requested_end, calendar_end)
@@ -2103,7 +2512,7 @@ def main() -> None:
             f"Clipped to latest trade date {calendar_end.date()}."
         )
 
-    folds = _build_fold_dates(
+    raw_folds = _build_fold_dates(
         calendar=calendar,
         start_date=args.walk_forward_start,
         end_date=effective_end_str,
@@ -2115,7 +2524,9 @@ def main() -> None:
         valid_years=args.valid_years,
         train_base_start=args.train_base_start,
         history_years=args.history_years,
+        train_coverage_intervals=train_coverage_intervals,
     )
+    folds = raw_folds
 
     _mode = f"{args.step_years}y" if args.step_years > 0 else f"{args.step_weeks}w"
     _test_win = f"{args.test_years} year(s)" if args.step_years > 0 else f"{args.step_weeks} week(s)"
@@ -2128,6 +2539,12 @@ def main() -> None:
     print(f"  range   : {args.walk_forward_start} -> {effective_end_str}")
     print(f"  data max: {calendar_end.date()}")
     print(f"  segment : {args.segment_years} year(s)")
+    if train_coverage_intervals:
+        coverage_start = train_coverage_intervals[0][0].date()
+        coverage_end = train_coverage_intervals[-1][1].date()
+        print(f"  train coverage : {coverage_start} -> {coverage_end}")
+    if not folds and raw_folds:
+        print("  note    : all candidate folds were dropped due to empty training coverage")
     for i, fold in enumerate(folds, start=1):
         print(
             f"  [{i:04d}/{len(folds):04d}] signal={fold['signal_date']} pred={fold['pred_date']} test={fold['test_start']} ~ {fold['test_end']} oos={fold['test_start']} ~ {fold['oos_end']} "

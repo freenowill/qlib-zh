@@ -72,8 +72,9 @@ def patch_yaml(
     # 1. 更新 data_handler_config
     # ──────────────────────────────────────────
     dh = doc.get("data_handler_config", {})
+    handler_start = data_start or dates["train_start"]
     # handler 的全局时间范围覆盖训练+验证+测试
-    dh["start_time"]     = data_start or dates["train_start"]
+    dh["start_time"]     = handler_start
     dh["end_time"]       = dates["test_end"]
     dh["fit_start_time"] = dates["train_start"]
     dh["fit_end_time"]   = dates["train_end"]
@@ -92,7 +93,7 @@ def patch_yaml(
     hkw = doc["task"]["dataset"]["kwargs"]["handler"]
     if isinstance(hkw, dict) and "kwargs" in hkw:
         hkw["kwargs"].update(
-            start_time=dates["train_start"],
+            start_time=handler_start,
             end_time=dates["test_end"],
             fit_start_time=dates["train_start"],
             fit_end_time=dates["train_end"],
