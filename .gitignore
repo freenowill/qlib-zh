@@ -52,3 +52,5 @@ tags
 ./pretrain
 .idea/
 .aider*
+cn_data/
+cn_data_update/
