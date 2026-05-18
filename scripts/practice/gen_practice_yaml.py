@@ -14,7 +14,11 @@ import yaml
 
 
 def validate_date_order(dates: dict) -> None:
-    """Ensure train/valid/test windows are strictly ordered and non-overlapping."""
+    """Ensure train/valid/test windows are ordered and non-overlapping.
+
+    train/valid boundaries are strictly ordered; test_start <= test_end is
+    allowed so that a single-day prediction window works in predict_only mode.
+    """
     keys = ["train_start", "train_end", "valid_start", "valid_end", "test_start", "test_end"]
     missing = [k for k in keys if k not in dates]
     if missing:
@@ -22,7 +26,13 @@ def validate_date_order(dates: dict) -> None:
 
     parsed = {k: pd.Timestamp(dates[k]) for k in keys}
     for left, right in zip(keys, keys[1:]):
-        if parsed[left] >= parsed[right]:
+        # Allow test_start == test_end for single-day prediction windows
+        if left == "test_start" and right == "test_end":
+            if parsed[left] > parsed[right]:
+                raise ValueError(
+                    f"Invalid date order: {left}={parsed[left].date()} must not be later than {right}={parsed[right].date()}"
+                )
+        elif parsed[left] >= parsed[right]:
             raise ValueError(
                 f"Invalid date order: {left}={parsed[left].date()} must be earlier than {right}={parsed[right].date()}"
             )

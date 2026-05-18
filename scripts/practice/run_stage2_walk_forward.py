@@ -2424,6 +2424,346 @@ def _write_full_backtest_report(
     print(f"✓ Full-cycle signal: {full_dir / 'signal.csv'}")
 
 
+# ──────────────────────────────────────────────────
+# Predict-only helpers
+# ──────────────────────────────────────────────────
+
+def _find_latest_fold_checkpoint(
+    wf_root: Path,
+    model_specs: list[dict],
+) -> dict[str, object]:
+    """Find the latest completed fold's model checkpoint and config."""
+    segments_dir = wf_root / "segments"
+    if not segments_dir.exists():
+        raise FileNotFoundError(f"No walk-forward segments found: {segments_dir}")
+
+    segment_keys = sorted(
+        [d.name for d in segments_dir.iterdir() if d.is_dir()],
+        reverse=True,
+    )
+
+    for seg_key in segment_keys:
+        seg_dir = segments_dir / seg_key
+        fold_csv = seg_dir / "segment_folds.csv"
+        if not fold_csv.exists():
+            continue
+
+        folds_df = pd.read_csv(fold_csv)
+        if folds_df.empty:
+            continue
+
+        for _, row in folds_df.iloc[::-1].iterrows():
+            fold_tag = str(row.get("fold_tag", ""))
+            if not fold_tag:
+                continue
+
+            fold_dir = wf_root / fold_tag
+            result: dict[str, object] = {
+                "fold_tag": fold_tag,
+                "signal_date": str(row.get("signal_date", fold_tag)),
+                "train_start": str(row.get("train_start", "")),
+                "train_end": str(row.get("train_end", "")),
+                "checkpoints": {},
+                "fold_config": None,
+                "template_path": None,
+                "model_mode": None,
+                "model_configs": {},  # Per-model config: {name: {"template": ..., "model_mode": ...}}
+            }
+
+            has_all_checkpoints = True
+            for spec in model_specs:
+                model_name = str(spec["name"])
+                ckpt = fold_dir / "model_runs" / model_name / "mlflow_run" / "artifacts" / "params.pkl"
+                config = fold_dir / "model_runs" / model_name / "workflow_config_practice.yaml"
+                if ckpt.exists() and config.exists():
+                    result["checkpoints"][model_name] = ckpt
+                    result["model_configs"][model_name] = {
+                        "template": str(spec.get("template", "")),
+                        "model_mode": str(spec.get("model_mode", "default")),
+                    }
+                    if result["fold_config"] is None:
+                        result["fold_config"] = config
+                        result["template_path"] = str(spec.get("template", ""))
+                        result["model_mode"] = str(spec.get("model_mode", "default"))
+                else:
+                    has_all_checkpoints = False
+
+            if has_all_checkpoints and result["checkpoints"]:
+                return result
+
+    raise FileNotFoundError(
+        f"No completed fold with model checkpoints found under {wf_root}"
+    )
+
+
+def _predict_only_export(
+    pred_df: pd.DataFrame,
+    label_df: pd.DataFrame | None,
+    fold_output: Path,
+    pred_date: str,
+) -> None:
+    """Lightweight export for predict_only mode (no mlflow dependency)."""
+    fold_output.mkdir(parents=True, exist_ok=True)
+
+    if isinstance(pred_df.index, pd.MultiIndex):
+        pred_df.index.names = ["datetime", "instrument"]
+
+    slice_df = pred_df.copy()
+    if isinstance(slice_df.index, pd.MultiIndex):
+        dates_available = slice_df.index.get_level_values("datetime").unique()
+        if pred_date in dates_available.astype(str):
+            slice_df = slice_df.xs(pred_date, level="datetime")
+        else:
+            latest = dates_available.max()
+            print(f"⚠ pred_date={pred_date} not in predictions, using latest: {latest}")
+            pred_date = pd.Timestamp(latest).strftime("%Y-%m-%d")
+            slice_df = slice_df.xs(latest, level="datetime")
+
+    slice_df = slice_df.reset_index()
+    if "instrument" not in slice_df.columns:
+        slice_df.columns = ["instrument", "score"] if len(slice_df.columns) == 2 else ["score"]
+        if "instrument" not in slice_df.columns:
+            slice_df.index.name = "instrument"
+            slice_df = slice_df.reset_index()
+
+    slice_df = slice_df.sort_values("score", ascending=False).reset_index(drop=True)
+    n = len(slice_df)
+    slice_df["rank"] = range(1, n + 1)
+    slice_df["rank_pct"] = (slice_df["rank"] / n * 100).round(2).astype(str) + "%"
+    slice_df["pred_date"] = pred_date
+    slice_df["date"] = pred_date
+    slice_df["score_final"] = slice_df["score"]
+    slice_df["score_quantile"] = (1.0 - (slice_df["rank"] - 1) / max(n, 1)).round(6)
+    slice_df["percentile"] = slice_df["score_quantile"]
+    slice_df["quantile_bucket"] = np.select(
+        [
+            slice_df["rank"] <= max(int(np.ceil(n * 0.01)), 1),
+            slice_df["rank"] <= max(int(np.ceil(n * 0.05)), 1),
+            slice_df["rank"] <= max(int(np.ceil(n * 0.10)), 1),
+        ],
+        ["top_1pct", "top_5pct", "top_10pct"],
+        default="others",
+    )
+    slice_df["code"] = slice_df["instrument"].astype(str).str.replace(r'^[A-Za-z]+', '', regex=True).str.zfill(6)
+    slice_df["stock"] = slice_df["code"]
+
+    preferred_cols = [
+        "stock", "code", "instrument", "date", "pred_date",
+        "score", "rank", "percentile", "rank_pct",
+        "score_quantile", "quantile_bucket", "score_final",
+    ]
+    scores_df = slice_df[[c for c in preferred_cols if c in slice_df.columns]].copy()
+    scores_df.to_csv(fold_output / "scores.csv", index=False, encoding="utf-8-sig")
+
+    # all_scores.csv (single date for predict_only)
+    all_df = pred_df.reset_index().copy()
+    if isinstance(all_df.columns, pd.MultiIndex):
+        all_df.columns = [c[0] for c in all_df.columns]
+    rename_map = {}
+    if "datetime" not in all_df.columns and len(all_df.columns) >= 3:
+        cols = list(all_df.columns)
+        cols[0] = "datetime"
+        cols[1] = "instrument"
+        cols[2] = "score"
+        all_df.columns = cols
+    elif "instrument" not in all_df.columns and len(all_df.columns) >= 2:
+        cols = list(all_df.columns)
+        cols[0] = "instrument"
+        cols[1] = "score"
+        all_df.columns = cols
+    all_df.to_csv(fold_output / "all_scores.csv", index=False, encoding="utf-8-sig")
+
+    # metrics.csv (minimal)
+    metrics = {"pred_date": pred_date, "predict_only": True}
+    pd.DataFrame([metrics]).to_csv(fold_output / "metrics.csv", index=False, encoding="utf-8-sig")
+
+    # pred.pkl and label.pkl for compatibility
+    with open(fold_output / "pred.pkl", "wb") as f:
+        pickle.dump(pred_df[["score"]], f)
+    if label_df is not None and not label_df.empty:
+        with open(fold_output / "label.pkl", "wb") as f:
+            pickle.dump(label_df[["label"]], f)
+
+    print(f"✓ Predict-only scores exported: {fold_output / 'scores.csv'} ({len(scores_df)} stocks)")
+
+
+def _predict_only_main(args, template_path, output_root, wf_root) -> None:
+    """Predict-only mode: load latest fold's model, predict for today, no training."""
+    import qlib
+    from qlib.config import C
+    from qlib.data.dataset.handler import DataHandlerLP
+    from qlib.model.base import Model as QlibModel
+    from qlib.utils import init_instance_by_config
+
+    print("═══════════════════════════════════════════════")
+    print("Predict-only mode: loading existing model, no training")
+    print("═══════════════════════════════════════════════")
+
+    walk_forward_end = args.pred_date or args.walk_forward_end or args.latest_pred_date
+    if not walk_forward_end:
+        raise ValueError("walk-forward-end or latest-pred-date must be provided")
+
+    # Init qlib and load calendar
+    _, calendar = _load_trade_calendar(
+        template_path=template_path,
+        uri_folder=args.uri_folder,
+        start_date=args.train_base_start,
+        end_date=walk_forward_end,
+    )
+    calendar_end = pd.Timestamp(calendar.max())
+    requested_end = pd.Timestamp(walk_forward_end)
+    pred_date = _fmt(min(requested_end, calendar_end))
+    print(f"  Prediction date: {pred_date}")
+    print(f"  Calendar max: {calendar_end.date()}")
+
+    # Find latest fold checkpoint
+    print("\n[1/5] Finding latest fold checkpoint...")
+    fold_info = _find_latest_fold_checkpoint(wf_root, MODEL_SPECS)
+    print(f"  Fold: {fold_info['fold_tag']}")
+    print(f"  Train: {fold_info['train_start']} ~ {fold_info['train_end']}")
+    for name, ckpt in fold_info["checkpoints"].items():
+        print(f"  {name}: {ckpt}")
+
+    # Regenerate YAML config with today as test date
+    print("\n[2/5] Generating config for today's prediction...")
+    predict_fold_dir = wf_root / f"predict_only_{pred_date.replace('-', '')}"
+    predict_fold_dir.mkdir(parents=True, exist_ok=True)
+
+    model_frames: dict[str, pd.DataFrame] = {}
+    label_frames: dict[str, pd.DataFrame] = {}
+
+    for spec in MODEL_SPECS:
+        model_name = str(spec["name"])
+        ckpt_path = fold_info["checkpoints"].get(model_name)
+        if ckpt_path is None:
+            print(f"  ⚠ No checkpoint for {model_name}, skipping")
+            continue
+
+        # Use per-model config if available, otherwise fall back to fold-level config
+        model_config = fold_info.get("model_configs", {}).get(model_name, {})
+        model_template = model_config.get("template", fold_info["template_path"])
+        model_mode = model_config.get("model_mode", fold_info["model_mode"])
+
+        print(f"\n[3/5] Processing {model_name}...")
+        model_dir = predict_fold_dir / model_name
+        model_dir.mkdir(parents=True, exist_ok=True)
+        fold_config = model_dir / "workflow_config_practice.yaml"
+
+        # Generate YAML with today as test date
+        # Use minimal non-overlapping windows for train/valid (only test segment is used for prediction)
+        # fit_start/fit_end in handler uses train window for normalization consistency
+        _run(
+            [
+                sys.executable,
+                str(SCRIPTS / "gen_practice_yaml.py"),
+                "--template",
+                str(model_template),
+                "--output",
+                str(fold_config),
+                "--model-mode",
+                str(model_mode),
+                "--data-start",
+                str(args.train_base_start),
+                "--sample-weight-half-life",
+                str(args.half_life),
+                "--train-start",
+                str(fold_info["train_start"]),
+                "--train-end",
+                str(fold_info["train_end"]),
+                "--valid-start",
+                str(pd.Timestamp(fold_info["train_end"]) + pd.Timedelta(days=1)).split(" ")[0],
+                "--valid-end",
+                str(pd.Timestamp(pred_date) - pd.Timedelta(days=1)).split(" ")[0],
+                "--test-start",
+                pred_date,
+                "--test-end",
+                pred_date,
+            ],
+            cwd=ROOT,
+        )
+
+        # Load config and init qlib model + dataset
+        cfg = _load_template(fold_config)
+        task_config = cfg.get("task", {})
+        qlib_init = cfg.get("qlib_init", {})
+
+        # Re-init qlib if needed (different config)
+        exp_manager = C["exp_manager"]
+        exp_manager["kwargs"]["uri"] = "file:" + str(Path(os.getcwd()).resolve() / args.uri_folder)
+        qlib.init(**qlib_init, exp_manager=exp_manager)
+
+        # Create dataset
+        dataset = init_instance_by_config(task_config["dataset"])
+
+        # Load model from checkpoint
+        print(f"  Loading checkpoint: {ckpt_path}")
+        with open(ckpt_path, "rb") as f:
+            saved_model = pickle.load(f)
+
+        # Create fresh model instance and set the trained booster
+        model: QlibModel = init_instance_by_config(task_config["model"])
+        inner = getattr(saved_model, "model", None)
+        if inner is not None:
+            model.model = inner
+        else:
+            model = saved_model
+
+        # Predict on test segment
+        print(f"  Predicting on test segment ({pred_date})...")
+        try:
+            pred = model.predict(dataset, segment="test")
+        except TypeError:
+            pred = model.predict(dataset)
+
+        pred_df = _to_score_frame(pred, "score")
+        print(f"  Predictions: {len(pred_df)} rows, {pred_df.index.get_level_values('datetime').nunique()} dates")
+
+        # Try to get labels
+        label_df = None
+        try:
+            label_raw = dataset.prepare("test", col_set="label", data_key=DataHandlerLP.DK_L)
+            label_df = _to_label_frame(label_raw)
+        except Exception:
+            pass
+
+        model_frames[model_name] = pred_df
+        if label_df is not None:
+            label_frames[model_name] = label_df
+
+    if not model_frames:
+        raise RuntimeError("No model predictions generated")
+
+    # Ensemble if multiple models
+    if len(model_frames) > 1:
+        print("\n[4/5] Ensembling predictions...")
+        # Use equal weights (no validation IC available in predict_only mode)
+        weights = {name: 1.0 / len(model_frames) for name in model_frames}
+        ensemble_pred = _combine_model_predictions(model_frames, weights)
+    else:
+        ensemble_pred = next(iter(model_frames.values()))
+        weights = {next(iter(model_frames.keys())): 1.0}
+
+    # Export
+    print("\n[5/5] Exporting scores...")
+    fold_output = predict_fold_dir / "model_predict"
+    label_for_export = next(iter(label_frames.values()), None) if label_frames else None
+    _predict_only_export(
+        pred_df=ensemble_pred[["score"]],
+        label_df=label_for_export,
+        fold_output=fold_output,
+        pred_date=pred_date,
+    )
+
+    # Copy to root output for stage3-6
+    _copy_fold_outputs(fold_output, output_root)
+
+    print("\n═══════════════════════════════════════════════")
+    print(f"Predict-only complete")
+    print(f"  Scores: {output_root / 'scores.csv'}")
+    print(f"  Prediction date: {pred_date}")
+    print("═══════════════════════════════════════════════")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--template", required=True, help="Base workflow YAML template")
@@ -2452,6 +2792,10 @@ def main() -> None:
     ap.add_argument("--hold-num", type=int, default=int(os.environ.get("HOLD_NUM", "5")))
     ap.add_argument("--segment-years", type=int, default=1, help="Group folds into year chunks for staged execution")
     ap.add_argument("--model-mode", choices=["default", "robust"], default="robust")
+    ap.add_argument("--predict-only", action="store_true", default=False,
+                    help="Skip training, load latest fold's model checkpoint and predict only")
+    ap.add_argument("--pred-date", default=None,
+                    help="Override prediction date for predict-only mode (YYYY-MM-DD)")
     args = ap.parse_args()
 
     template_path = Path(args.template)
@@ -2466,6 +2810,15 @@ def main() -> None:
         elif template_str.startswith("/work"):
             rel = Path(template_str[len("/work"):].lstrip("/"))
             template_path = ROOT / rel
+
+    # Predict-only mode: skip training, just load model and predict
+    if args.predict_only:
+        output_root = Path(args.output_root)
+        output_root.mkdir(parents=True, exist_ok=True)
+        wf_root = output_root / "walk_forward"
+        wf_root.mkdir(parents=True, exist_ok=True)
+        _predict_only_main(args, template_path, output_root, wf_root)
+        return
 
     if args.step_years <= 0 and args.step_weeks <= 0:
         raise ValueError("Either --step-years or --step-weeks must be positive")
