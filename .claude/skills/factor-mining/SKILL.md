@@ -134,7 +134,7 @@ docker run --rm \
   --dns 8.8.8.8 --dns 114.114.114.114 \
   -e PYTHONPATH="$HOST_PWD" \
   -e DOCKER_HOST=unix:///var/run/docker.sock \
-  -e OPENAI_API_KEY='sk-c697147e8ba0406c8ae76839f21d2048' \
+  -e OPENAI_API_KEY=YOUR_API_KEY \
   -e CHAT_MODEL='openai/deepseek-v4-pro' \
   -e OPENAI_API_BASE="http://${HOST_IP}:18080/v1" \
   -e CONDA_DEFAULT_ENV=qlib_env \
@@ -269,17 +269,17 @@ Update this table after each successful run. Mark categories with factors:
 
 | Category | Status | Factors discovered |
 |----------|--------|--------------------|
-| 动量/反转 | DONE | MediumTermMomentum_20d, 20_day_reversal |
-| 波动率 | DONE | RealizedVolatility_20d |
+| 动量/反转 | DONE | MediumTermMomentum_20d, 20_day_reversal, momentum_5d, reversal_1d |
+| 波动率 | DONE | RealizedVolatility_20d, intraday_volatility |
 | 震荡 | DONE | RSI_14d |
-| 流动性 | DONE | 5_day_volume_change |
-| 估值 | DONE | trailing_PE_ratio |
-| 量价 | DONE | obv_slope_10day |
+| 流动性 | DONE | 5_day_volume_change, volume_ratio_5d |
+| 估值 | DONE | trailing_PE_ratio, earnings_yield |
+| 量价 | DONE | obv_slope_10day, volume_weighted_momentum_5d |
 | 风险调整 | DONE | sharpe_10day |
-| 质量 | TODO | ROE, ROA, profit margin factors needed |
+| 质量 | DONE | roe, net_profit_margin |
 | 成长 | TODO | EPS/revenue/BPS growth factors needed |
 | 财务杠杆 | TODO | debt/assets, liability/equity factors needed |
 | 现金流 | TODO | OCF, FCF, OCF/profit factors needed |
 | 市值/规模 | TODO | total_mv, circ_mv factors needed |
 | 股息 | TODO | dv_ratio, dv_ttm factors needed |
-| 运营效率 | TODO | op/revenue, revenue_ps factors needed |
+| 运营效率 | DONE | net_profit_margin (also covers 质量) |
