@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# run_explore_data.sh - 构建 cn_extra_data 全量数据集 (用于 AlphaExtra stage2 训练)
+# run_explore_data.sh - 构建 cn_extra_data_improve 全量数据集
 #
-# 功能: 将 test_tushare.py、check_health.py、explore_extra_data.py 串联起来，
-#       对所有股票执行 数据拉取 → 健康检查 → qlib格式转换 的完整流程。
+# 流程:
+#   [Pre]  智能增量更新 — 已有数据做新鲜度检测+增量拉取; 无数据股票全量拉取
+#   [Main] 并行处理      — test_tushare → check_health → process_extra_data (CSV→bin+因子)
+#   [Post] 索引构建      — 日历 + instruments + 因子清单
 #
-# 输出: cn_extra_data/ 目录，包含 58 个特征 (10 行情 + 15 估值 + 18 财务指标 + 15 财报)
-#       供 AlphaExtra handler (stage2 训练) 使用
+# 因子定义: tushare/new_factor.md (30 个因子，含动量/反转/波动率/流动性/估值/量价/风险调整/质量/截面)
 #
 # 用法:
-#   ./run_explore_data.sh                          # 处理 cn_data/instruments/all.txt 中所有股票
-#   ./run_explore_data.sh SZ000001 SH600000        # 只处理指定股票
-#   ./run_explore_data.sh --resume                 # 跳过已成功处理的股票
-#   ./run_explore_data.sh --resume --max-fail 20   # 允许最多20只失败后继续
-#   ./run_explore_data.sh -j 8 --resume            # 8路并发 (默认)
+#   ./run_explore_data.sh                              # 全量 (含因子计算)
+#   ./run_explore_data.sh --no-improve                 # 仅基础特征 (不含 new_factor.md 因子)
+#   ./run_explore_data.sh --resume                     # 断点续跑
+#   ./run_explore_data.sh -j 8 --resume                # 8路并发
+#   ./run_explore_data.sh SZ000001 SH600000             # 指定股票
 #
 # 环境: 使用 zhuhai123/local_qlib:v1-tushare Docker 镜像
 
@@ -26,7 +27,8 @@ STAMP_DIR="${SCRIPT_DIR}/extra_data/.done"
 LOG_DIR="${SCRIPT_DIR}/extra_data/.logs"
 MAX_FAIL=10
 RESUME=false
-JOBS=8
+JOBS=20
+IMPROVE=true
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -45,17 +47,18 @@ usage() {
 
 选项:
   -j, --jobs N        并发数 (默认 8)
-  --resume            跳过 extra_data/ 中已有数据的股票
+  --resume            跳过 extra_data/.done 中已完成的股票
+  --no-improve        不生成 cn_extra_data_improve
+  --market INDEX      限定指数成分股 (csi300/csi500/csi800/csi1000/all, 默认 all)
   --max-fail N        允许连续失败 N 只后终止 (默认 10，0=不限)
   --instruments FILE  使用指定的股票列表文件 (默认 cn_data/instruments/all.txt)
   -h, --help          显示帮助
 
 示例:
-  ./run_explore_data.sh                           # 全量处理 (8路并发)
+  ./run_explore_data.sh                           # 全量 + improve (8路并发)
+  ./run_explore_data.sh --market csi800 -j 4      # 仅 CSI800 成分股
   ./run_explore_data.sh -j 4 --resume             # 4路并发，断点续跑
-  ./run_explore_data.sh --resume                  # 断点续跑
-  ./run_explore_data.sh SZ000001 SH600000         # 只跑指定股票
-  ./run_explore_data.sh --max-fail 0              # 永不停止
+  ./run_explore_data.sh --no-improve              # 仅 cn_extra_data
 EOF
     exit 0
 }
@@ -64,28 +67,42 @@ EOF
 SYMBOLS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -j|--jobs)     JOBS="$2"; shift 2 ;;
-        --resume)      RESUME=true; shift ;;
-        --max-fail)    MAX_FAIL="$2"; shift 2 ;;
-        --instruments) INSTRUMENTS_FILE="$2"; shift 2 ;;
-        -h|--help)     usage ;;
-        -*)            err "未知选项: $1"; usage ;;
-        *)             SYMBOLS+=("$1"); shift ;;
+        -j|--jobs)       JOBS="$2"; shift 2 ;;
+        --resume)        RESUME=true; shift ;;
+        --no-improve)    IMPROVE=false; shift ;;
+        --max-fail)      MAX_FAIL="$2"; shift 2 ;;
+        --market)        TARGET_MARKET="$2"; shift 2 ;;
+        --instruments)   INSTRUMENTS_FILE="$2"; shift 2 ;;
+        -h|--help)       usage ;;
+        -*)              err "未知选项: $1"; usage ;;
+        *)               SYMBOLS+=("$1"); shift ;;
     esac
 done
 
-# 加载股票列表 (排除指数代码，保留个股)
+# 加载股票列表 (排除指数代码，保留个股，支持指数成分股过滤)
 load_symbols() {
     if [[ ${#SYMBOLS[@]} -gt 0 ]]; then
         echo "${SYMBOLS[@]}"
         return
     fi
+
+    local market="${TARGET_MARKET:-all}"
+
+    # 如果指定了指数，从对应 csi*.txt 加载
+    if [[ "$market" != "all" ]]; then
+        local idx_file="${SCRIPT_DIR}/cn_data/instruments/${market}.txt"
+        if [[ -f "$idx_file" ]]; then
+            awk -F'\t' '!/^#/ && NF >= 1 {print $1}' "$idx_file" | sort -u
+            return
+        fi
+        warn "指数文件不存在: $idx_file，回退到全量"
+    fi
+
     if [[ ! -f "$INSTRUMENTS_FILE" ]]; then
         err "股票列表不存在: $INSTRUMENTS_FILE"
         exit 1
     fi
-    # 保留: SH6xxxxx (沪市个股), SZ非399xxx (深市个股)
-    # 排除: SH000xxx (上证指数), SZ399xxx (深证指数), BJ (北交所无日线数据)
+    # SH6xxxxx (沪市个股), SZ非399xxx (深市个股)
     awk -F'\t' '!/^#/ && NF >= 1 {
         code = substr($1, 3, 3)
         if ($1 ~ /^SH/ && code ~ /^6/) print $1
@@ -94,30 +111,39 @@ load_symbols() {
 }
 
 ALL_SYMBOLS=($(load_symbols))
-TOTAL=${#ALL_SYMBOLS[@]}
-log "股票总数: ${TOTAL}, 并发数: ${JOBS}"
 
+# --resume: 仅处理已有 daily.csv 的股票，跳过从未拉取成功的
 if [[ "$RESUME" == true ]]; then
     mkdir -p "$STAMP_DIR"
+    filtered=()
+    for sym in "${ALL_SYMBOLS[@]}"; do
+        if [[ -f "${EXTRA_DATA_DIR}/${sym}/daily.csv" ]]; then
+            filtered+=("$sym")
+        fi
+    done
+    log "resume 过滤: ${#ALL_SYMBOLS[@]} → ${#filtered[@]} 只 (已有数据)"
+    ALL_SYMBOLS=("${filtered[@]}")
 fi
+
+TOTAL=${#ALL_SYMBOLS[@]}
+log "股票总数: ${TOTAL}, 并发数: ${JOBS}, improve: ${IMPROVE}"
 mkdir -p "$LOG_DIR"
 
 # ============================================================
-# 构建全局日历 (从已有 daily.csv 收集所有交易日期)
+# 全局日历
 # ============================================================
-GLOBAL_CALENDAR="${SCRIPT_DIR}/cn_extra_data/calendars/day.txt"
+GLOBAL_CALENDAR="${SCRIPT_DIR}/cn_extra_data_improve/calendars/day.txt"
 build_global_calendar() {
     log "构建全局交易日历..."
-    mkdir -p "${SCRIPT_DIR}/cn_extra_data/calendars"
+    mkdir -p "${SCRIPT_DIR}/cn_extra_data_improve/calendars"
     local tmp_cal
     tmp_cal=$(mktemp)
-    for csv in "${EXTRA_DATA_DIR}"/*/daily.csv; do
-        [[ -f "$csv" ]] || continue
+    while IFS= read -r -d '' csv; do
         awk -F',' 'NR>1{
             d=$2
             print substr(d,1,4)"-"substr(d,5,2)"-"substr(d,7,2)
         }' "$csv"
-    done | sort -u > "$tmp_cal"
+    done < <(find "${EXTRA_DATA_DIR}" -maxdepth 2 -name "daily.csv" -type f -print0) | sort -u > "$tmp_cal"
     local count
     count=$(wc -l < "$tmp_cal" | tr -d ' ')
     if [[ "$count" -gt 0 ]]; then
@@ -130,7 +156,64 @@ build_global_calendar() {
 }
 build_global_calendar
 
+# ============================================================
+# [Pre] 智能增量更新
+#   1. 对已有 daily.csv 的股票，检测新鲜度并增量拉取
+#   2. 对没有 daily.csv 的股票，后续由 test_tushare.py 全量拉取
+# ============================================================
+smart_incremental_update() {
+    log "========== [Pre] 智能增量更新 =========="
+
+    local existing_stocks=()
+    local new_stocks=()
+
+    for sym in "${ALL_SYMBOLS[@]}"; do
+        if [[ -f "${EXTRA_DATA_DIR}/${sym}/daily.csv" ]]; then
+            existing_stocks+=("$sym")
+        else
+            new_stocks+=("$sym")
+        fi
+    done
+
+    log "已有数据: ${#existing_stocks[@]} 只, 待拉取: ${#new_stocks[@]} 只"
+
+    if [[ ${#existing_stocks[@]} -eq 0 ]]; then
+        log "无已有数据，跳过增量检测"
+        return
+    fi
+
+    # 对已有数据的股票运行新鲜度检测 + 增量拉取 (csv-only 模式)
+    # process_extra_data.py --csv-only: 检测新鲜度 → 增量拉取 → 仅更新 CSV
+    log "检测已有数据新鲜度并增量拉取..."
+    docker run --rm \
+        -v "${SCRIPT_DIR}:/workspace" \
+        -w /workspace \
+        "$DOCKER_IMAGE" \
+        python3 process_extra_data.py --csv-only --symbols "${existing_stocks[@]}" 2>&1 | \
+        while IFS= read -r line; do
+            if echo "$line" | grep -qE '(INFO|WARNING|ERROR)'; then
+                echo "  $line"
+            fi
+        done
+
+    local exit_code=${PIPESTATUS[0]}
+    if [[ "$exit_code" -ne 0 ]]; then
+        warn "增量更新部分失败 (exit=$exit_code)，将继续处理"
+    else
+        ok "增量更新完成"
+    fi
+}
+
+# --resume 时跳过增量检测 (数据已在首次运行时处理完毕)
+if [[ "$RESUME" == true ]]; then
+    log "--resume: 跳过增量检测，直接进入并行处理"
+else
+    smart_incremental_update
+fi
+
+# ============================================================
 # 标记成功 (原子操作，线程安全)
+# ============================================================
 mark_done() {
     [[ "$RESUME" == true ]] && touch "${STAMP_DIR}/${1}.done"
 }
@@ -139,13 +222,38 @@ is_done() {
     [[ "$RESUME" == true && -f "${STAMP_DIR}/${1}.done" ]]
 }
 
+# ============================================================
 # 单只股票处理 (在子 shell 中运行，输出写入日志文件)
+# ============================================================
 process_one() {
     local symbol="$1"
     local idx="$2"
     local log_file="${LOG_DIR}/${symbol}.log"
 
+    # --resume: 已完成股票跳过，或仅补跑 improve
     if is_done "$symbol"; then
+        if [[ "$IMPROVE" == true ]]; then
+            local sym_lower; sym_lower=$(echo "$symbol" | tr '[:upper:]' '[:lower:]')
+            local improve_feat_dir="${SCRIPT_DIR}/cn_extra_data_improve/features/${sym_lower}"
+            if [[ -d "$improve_feat_dir" ]] && ls "$improve_feat_dir"/*.bin >/dev/null 2>&1; then
+                echo "SKIP" > "${log_file}.status"
+                return 0
+            fi
+            # 有 .done 但缺 improve → 仅跑 improve
+            echo "[$(date '+%H:%M:%S')] [${idx}/${TOTAL}] ${symbol} improve-only: CSV→bin+因子" > "$log_file"
+            if docker run --rm \
+                -v "${SCRIPT_DIR}:/workspace" \
+                -w /workspace \
+                "$DOCKER_IMAGE" \
+                python3 process_extra_data.py --mode improve-stock --symbols "$symbol" >> "$log_file" 2>&1; then
+                echo "[$(date '+%H:%M:%S')] [OK] ${symbol} improve 完成" >> "$log_file"
+                echo "OK" > "${log_file}.status"
+            else
+                echo "[$(date '+%H:%M:%S')] [WARN] ${symbol} improve 失败" >> "$log_file"
+                echo "OK" > "${log_file}.status"
+            fi
+            return 0
+        fi
         echo "SKIP" > "${log_file}.status"
         return 0
     fi
@@ -172,18 +280,18 @@ process_one() {
         "$DOCKER_IMAGE" \
         python3 check_health.py "$symbol" >> "$log_file" 2>&1 || true
 
-    # Step 3: 转换为 qlib bin (使用全局日历对齐)
-    echo "[$(date '+%H:%M:%S')] [${idx}/${TOTAL}] ${symbol} Step3: qlib格式转换" >> "$log_file"
-    local calendar_arg=""
-    [[ -f "$GLOBAL_CALENDAR" ]] && calendar_arg="--calendar /workspace/cn_extra_data/calendars/day.txt"
-    if ! docker run --rm \
-        -v "${SCRIPT_DIR}:/workspace" \
-        -w /workspace \
-        "$DOCKER_IMAGE" \
-        python3 explore_extra_data.py "$symbol" $calendar_arg >> "$log_file" 2>&1; then
-        echo "[$(date '+%H:%M:%S')] [ERROR] ${symbol} Step3 失败: 格式转换" >> "$log_file"
-        echo "FAIL" > "${log_file}.status"
-        return 1
+    # Step 3: CSV → bin + new_factor.md 因子计算 → cn_extra_data_improve
+    if [[ "$IMPROVE" == true ]]; then
+        echo "[$(date '+%H:%M:%S')] [${idx}/${TOTAL}] ${symbol} Step3: CSV→bin+因子" >> "$log_file"
+        if ! docker run --rm \
+            -v "${SCRIPT_DIR}:/workspace" \
+            -w /workspace \
+            "$DOCKER_IMAGE" \
+            python3 process_extra_data.py --mode improve-stock --symbols "$symbol" >> "$log_file" 2>&1; then
+            echo "[$(date '+%H:%M:%S')] [ERROR] ${symbol} Step3 失败: CSV→bin+因子" >> "$log_file"
+            echo "FAIL" > "${log_file}.status"
+            return 1
+        fi
     fi
 
     echo "[$(date '+%H:%M:%S')] [OK] ${symbol} 全部完成" >> "$log_file"
@@ -193,7 +301,7 @@ process_one() {
 }
 
 # ============================================================
-# 并发执行主循环
+# [Main] 并发执行主循环
 # ============================================================
 START_TIME=$(date +%s)
 SUCCESS_COUNT=0
@@ -212,7 +320,6 @@ running_count() {
 
 # 等待一个任务完成，回收结果
 wait_one() {
-    # 轮询检查已完成的任务
     while true; do
         for f in "$RUNNING_DIR"/*.pid; do
             [[ -f "$f" ]] || continue
@@ -223,7 +330,6 @@ wait_one() {
                 symbol=$(basename "$f" .pid)
                 rm -f "$f"
 
-                # 读取状态
                 local status_file="${LOG_DIR}/${symbol}.log.status"
                 local status="UNKNOWN"
                 [[ -f "$status_file" ]] && status=$(cat "$status_file")
@@ -253,7 +359,6 @@ wait_one() {
                 return 0
             fi
         done
-        # 没有完成的任务，短暂等待后重试
         sleep 0.5
     done
 }
@@ -276,7 +381,6 @@ for i in "${!ALL_SYMBOLS[@]}"; do
     echo $! > "${RUNNING_DIR}/${symbol}.pid"
     submitted=$((submitted + 1))
 
-    # 每提交 JOBS 个任务打印一次进度
     if (( submitted % JOBS == 0 )); then
         log "已提交 ${submitted}/${TOTAL}, 运行中 $(running_count), 成功 ${SUCCESS_COUNT}, 失败 ${FAILED_COUNT}"
     fi
@@ -309,88 +413,88 @@ echo "=============================================="
 echo ""
 
 # ============================================================
-# 重建 qlib 索引 (calendar + instruments)
+# [Post] cn_extra_data_improve 索引构建 (特征已在并行阶段写入)
 # ============================================================
-rebuild_index() {
-    log "重建 qlib 索引..."
+build_improve_index() {
+    log "========== [Post] cn_extra_data_improve 索引 =========="
 
-    local extra_dir="${SCRIPT_DIR}/extra_data"
-    local qlib_dir="${SCRIPT_DIR}/cn_extra_data"
-    local cal_file="${qlib_dir}/calendars/day.txt"
-    local inst_file="${qlib_dir}/instruments/all.txt"
+    local improve_out="${SCRIPT_DIR}/cn_extra_data_improve"
+    local qlib_improve="${HOME}/.qlib/qlib_data/cn_extra_data_improve"
 
-    mkdir -p "${qlib_dir}/calendars" "${qlib_dir}/instruments"
+    mkdir -p "${improve_out}/calendars" "${improve_out}/instruments"
 
-    # 1. 从所有 daily.csv 收集全部交易日期 (刷新全局日历)
-    log "  刷新交易日历..."
-    local all_dates_file
-    all_dates_file=$(mktemp)
-    for csv in "${extra_dir}"/*/daily.csv; do
-        [[ -f "$csv" ]] || continue
-        awk -F',' 'NR>1{
-            d=$2
-            print substr(d,1,4)"-"substr(d,5,2)"-"substr(d,7,2)
-        }' "$csv"
-    done | sort -u > "$all_dates_file"
-
-    local date_count
-    date_count=$(wc -l < "$all_dates_file" | tr -d ' ')
-    if [[ "$date_count" -eq 0 ]]; then
-        err "未找到任何交易日期"
-        rm -f "$all_dates_file"
-        return 1
+    # 1. 日历 (已由 build_global_calendar 写入 cn_extra_data_improve/calendars/)
+    local cal_file="${improve_out}/calendars/day.txt"
+    if [[ -f "$cal_file" ]]; then
+        local cal_count; cal_count=$(wc -l < "$cal_file" | tr -d ' ')
+        log "  日历: ${cal_count} 天"
+    else
+        warn "  日历文件不存在，将由 process_extra_data.py 生成"
     fi
-    mv "$all_dates_file" "$cal_file"
-    log "  日历: ${date_count} 天 ($(head -1 "$cal_file") ~ $(tail -1 "$cal_file"))"
 
-    # 2. 从所有 daily.csv 构建 instruments (每只股票的实际日期范围)
-    log "  构建股票列表..."
-    local tmp_inst
-    tmp_inst=$(mktemp)
+    # 2. 构建 instruments
+    local inst_file="${improve_out}/instruments/all.txt"
+    local tmp_inst=$(mktemp)
     local stock_count=0
-
-    for csv in "${extra_dir}"/*/daily.csv; do
-        [[ -f "$csv" ]] || continue
-        local sym
+    while IFS= read -r -d '' csv; do
+        local sym start_d end_d
         sym=$(basename "$(dirname "$csv")")
-        # 从 daily.csv 获取日期范围
-        local start_date end_date
-        start_date=$(awk -F',' 'NR>1{print $2}' "$csv" | sort | head -1)
-        end_date=$(awk -F',' 'NR>1{print $2}' "$csv" | sort | tail -1)
-        if [[ -n "$start_date" && -n "$end_date" ]]; then
-            # 转为 YYYY-MM-DD 格式
-            start_date="${start_date:0:4}-${start_date:4:2}-${start_date:6:2}"
-            end_date="${end_date:0:4}-${end_date:4:2}-${end_date:6:2}"
-            echo -e "${sym}\t${start_date}\t${end_date}"
+        start_d=$(awk -F',' 'NR>1{print $2}' "$csv" | sort -n | head -1)
+        end_d=$(awk -F',' 'NR>1{print $2}' "$csv" | sort -n | tail -1)
+        if [[ -n "$start_d" && -n "$end_d" ]]; then
+            printf '%s\t%s-%s-%s\t%s-%s-%s\n' \
+                "$sym" \
+                "${start_d:0:4}" "${start_d:4:2}" "${start_d:6:2}" \
+                "${end_d:0:4}" "${end_d:4:2}" "${end_d:6:2}" >> "$tmp_inst"
             stock_count=$((stock_count + 1))
         fi
-    done | sort > "$tmp_inst"
-
+    done < <(find "${EXTRA_DATA_DIR}" -maxdepth 2 -name "daily.csv" -type f -print0 | sort -z)
+    sort -o "$tmp_inst" "$tmp_inst"
     mv "$tmp_inst" "$inst_file"
     log "  股票列表: ${stock_count} 只"
 
-    # 3. 链接到 qlib 标准路径
-    local qlib_data_dir="${HOME}/.qlib/qlib_data/cn_extra_data"
-    if [[ ! -e "$qlib_data_dir" ]]; then
-        mkdir -p "$(dirname "$qlib_data_dir")"
-        ln -sf "$qlib_dir" "$qlib_data_dir"
-        log "  已链接: $qlib_dir -> $qlib_data_dir"
+    # 3. 复制指数成分股文件
+    local cn_data_inst="${SCRIPT_DIR}/cn_data/instruments"
+    if [[ -d "$cn_data_inst" ]]; then
+        local idx_file
+        for idx_file in "$cn_data_inst"/csi*.txt; do
+            [[ -f "$idx_file" ]] || continue
+            cp "$idx_file" "${improve_out}/instruments/"
+        done
+        log "  指数文件已复制"
     fi
 
-    ok "qlib 索引重建完成 (日历 ${date_count} 天, 股票 ${stock_count} 只)"
+    # 4. 链接到 qlib 标准路径
+    if [[ ! -e "$qlib_improve" ]]; then
+        mkdir -p "$(dirname "$qlib_improve")"
+        ln -sf "$improve_out" "$qlib_improve"
+        log "  已链接: $improve_out -> $qlib_improve"
+    fi
+
+    # 5. 数据质量摘要
+    local n_stocks
+    n_stocks=$(ls -d "${improve_out}/features"/*/ 2>/dev/null | wc -l | tr -d ' ')
+    local n_bins=0
+    local sample_dir
+    sample_dir=$(ls -d "${improve_out}/features"/*/ 2>/dev/null | head -1)
+    if [[ -n "$sample_dir" ]]; then
+        n_bins=$(ls "${sample_dir}"/*.bin 2>/dev/null | wc -l | tr -d ' ')
+    fi
+    log "  数据质量: ${n_stocks} 只股票, ${n_bins} 特征/股"
+
+    ok "cn_extra_data_improve 索引构建完成"
 }
 
-rebuild_index
+if [[ "$IMPROVE" == true ]]; then
+    build_improve_index
+fi
 
-if [[ -d "${SCRIPT_DIR}/cn_extra_data/features" ]]; then
-    FEATURE_COUNT=$(ls -d "${SCRIPT_DIR}/cn_extra_data/features"/*/ 2>/dev/null | wc -l | tr -d ' ')
-    log "cn_extra_data 已有 ${FEATURE_COUNT} 只股票的特征数据"
-    if [[ "$FEATURE_COUNT" -lt "$TOTAL" ]]; then
-        REMAINING=$((TOTAL - FEATURE_COUNT))
-        warn "距离 AlphaExtra 全量训练还差 ${REMAINING} 只股票"
-    else
-        ok "cn_extra_data 已覆盖全部 ${TOTAL} 只股票，可用于 AlphaExtra stage2 训练"
-    fi
+# ============================================================
+# 最终状态
+# ============================================================
+if [[ "$IMPROVE" == true && -d "${SCRIPT_DIR}/cn_extra_data_improve/features" ]]; then
+    IMPROVE_COUNT=$(ls -d "${SCRIPT_DIR}/cn_extra_data_improve/features"/*/ 2>/dev/null | wc -l | tr -d ' ')
+    log "cn_extra_data_improve 已有 ${IMPROVE_COUNT} 只股票的特征数据 (基础特征 + new_factor.md 因子)"
 fi
 
 # 清理日志状态文件
