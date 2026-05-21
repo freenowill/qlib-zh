@@ -3,6 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 
 
+# Patch scipy.sparse.eye_array (removed in scipy 1.15) for cvxpy compatibility
+try:
+    import scipy.sparse as _scipy_sparse
+
+    if not hasattr(_scipy_sparse, "eye_array"):
+        _scipy_sparse.eye_array = _scipy_sparse.eye  # type: ignore[attr-defined]
+except Exception:
+    pass
+
+
 def _patch_rdagent_fin_factor() -> None:
     try:
         import os
@@ -47,20 +57,19 @@ def _patch_rdagent_fin_factor() -> None:
         return original_prepare(self, *args, **kwargs)
 
     def _patched_generate_data_folder_from_qlib():
-        template_path = Path("/Users/apple/gitee/qlib/rdagent_workspace/factor_data_template")
-        qtde = rdagent_env.QTDockerEnv()
-        qtde.prepare()
+        template_path = Path(__file__).resolve().parent / "rdagent_workspace" / "factor_data_template"
 
-        execute_log = qtde.check_output(local_path=str(template_path), entry="python generate.py")
-
-        assert (template_path / "daily_pv_all.h5").exists(), (
-            "daily_pv_all.h5 is not generated. It means rdagent_workspace/factor_data_template/generate.py is not executed correctly. Please check the log: \n"
-            + execute_log
-        )
-        assert (template_path / "daily_pv_debug.h5").exists(), (
-            "daily_pv_debug.h5 is not generated. It means rdagent_workspace/factor_data_template/generate.py is not executed correctly. Please check the log: \n"
-            + execute_log
-        )
+        # Skip Docker generation if HDF5 files already exist (pre-generated)
+        if not (template_path / "daily_pv_all.h5").exists() or not (template_path / "daily_pv_debug.h5").exists():
+            qtde = rdagent_env.QTDockerEnv()
+            qtde.prepare()
+            execute_log = qtde.check_output(local_path=str(template_path), entry="python generate.py")
+            assert (template_path / "daily_pv_all.h5").exists(), (
+                "daily_pv_all.h5 is not generated. Please check the log: \n" + execute_log
+            )
+            assert (template_path / "daily_pv_debug.h5").exists(), (
+                "daily_pv_debug.h5 is not generated. Please check the log: \n" + execute_log
+            )
 
         data_folder = Path(qlib_utils.FACTOR_COSTEER_SETTINGS.data_folder)
         data_folder.mkdir(parents=True, exist_ok=True)
@@ -74,6 +83,21 @@ def _patch_rdagent_fin_factor() -> None:
 
     rdagent_env.QTDockerEnv.prepare = _patched_prepare
     qlib_utils.generate_data_folder_from_qlib = _patched_generate_data_folder_from_qlib
+
+    # Stub embedding to avoid API calls (DeepSeek has no embedding endpoint)
+    try:
+        import rdagent.oai.backend.base as _base_embed
+
+        _DIM = 1536
+
+        def _fake_create_embedding(self, input_content, *args, **kwargs):
+            if isinstance(input_content, str):
+                return [0.0] * _DIM
+            return [[0.0] * _DIM for _ in input_content]
+
+        _base_embed.APIBackend.create_embedding = _fake_create_embedding
+    except Exception:
+        pass
 
 
 _patch_rdagent_fin_factor()
