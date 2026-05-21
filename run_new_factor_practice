@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+# =============================================================================
+# run_new_factor_practice — AlphaExtra 因子 walk-forward 训练 (stage1+stage2)
+#
+# 用法: bash run_new_factor_practice <experiment_name> [stage=N] [end_stage=N] [missing_threshold=N]
+# 示例: bash run_new_factor_practice extra_exp_20260515
+#       bash run_new_factor_practice extra_exp_20260515 stage=1
+#       bash run_new_factor_practice extra_exp_20260515 stage=2 missing_threshold=0.3
+#
+# Stage1: 检查 cn_extra_data_improve 数据健康度，过滤缺失过多的股票
+# Stage2: Walk-forward 训练与预测 (AlphaExtra handler)
+#
+# 依赖独立代码，不影响 run_alpha158_practice:
+#   - handler:  qlib.contrib.data.handler_extra (AlphaExtra)
+#   - template: examples/benchmarks/LightGBM/workflow_config_lightgbm_AlphaExtra.yaml
+#   - walk-fwd: scripts/practice/run_stage2_walk_forward_extra.py
+#   - health:   scripts/practice/stage1_data_health_extra.py
+# =============================================================================
+set -euo pipefail
+
+# ──────────────────────────────────────────────
+# 0. 参数解析
+# ──────────────────────────────────────────────
+if [[ $# -lt 1 ]]; then
+  echo "Usage: bash run_new_factor_practice <experiment_name> [stage=N] [end_stage=N] [missing_threshold=N]" >&2
+  echo "       stage=1: data health check & filter" >&2
+  echo "       stage=2: walk-forward training" >&2
+  echo "       missing_threshold: max missing ratio before exclusion (default: 0.5)" >&2
+  exit 1
+fi
+
+EXP_NAME="$1"
+shift
+
+START_STAGE=1
+END_STAGE=2
+MISSING_THRESHOLD=0.5
+
+for arg in "$@"; do
+  case "$arg" in
+    stage=*)              START_STAGE="${arg#stage=}" ;;
+    end_stage=*)          END_STAGE="${arg#end_stage=}" ;;
+    missing_threshold=*)  MISSING_THRESHOLD="${arg#missing_threshold=}" ;;
+    *) echo "Unknown argument: $arg" >&2; exit 1 ;;
+  esac
+done
+
+# ──────────────────────────────────────────────
+# 1. 全局路径 / 常量
+# ──────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUT_ROOT="$SCRIPT_DIR/DATA/analysis_outputs"
+OUT_DIR="$OUT_ROOT/$EXP_NAME"
+LOG_DIR="$OUT_DIR/logs"
+QDATA_HOST_DIR="${QLIB_HOST_DATA_DIR:-$HOME/.qlib}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-qlib-rdagent:v1}"
+WORKDIR_IN_CONTAINER="/work"
+OUT_DIR_IN_CONTAINER="$WORKDIR_IN_CONTAINER/DATA/analysis_outputs/$EXP_NAME"
+
+# AlphaExtra 使用 cn_extra_data_improve 作为数据源
+# cn_extra_data_improve 由 process_extra_data.py 生成，位于 tushare/cn_extra_data_improve/
+# 需要确保 Docker 容器内可访问: /root/.qlib/qlib_data/cn_extra_data_improve
+EXTRA_DATA_HOST="$SCRIPT_DIR/tushare/cn_extra_data_improve"
+EXTRA_DATA_QLIB="$QDATA_HOST_DIR/qlib_data/cn_extra_data_improve"
+if [[ -d "$EXTRA_DATA_HOST" && ! -e "$EXTRA_DATA_QLIB" ]]; then
+  echo "  链接 cn_extra_data: $EXTRA_DATA_HOST -> $EXTRA_DATA_QLIB"
+  mkdir -p "$(dirname "$EXTRA_DATA_QLIB")"
+  ln -sf "$EXTRA_DATA_HOST" "$EXTRA_DATA_QLIB"
+fi
+if [[ ! -d "$EXTRA_DATA_QLIB" ]]; then
+  echo "✗ cn_extra_data 不存在: $EXTRA_DATA_QLIB" >&2
+  echo "  请先运行 explore_extra_data.py 生成数据" >&2
+  exit 1
+fi
+export QLIB_DATA_DIR="$EXTRA_DATA_QLIB"
+
+# Stage1 过滤后的数据路径（容器通过 -v $QDATA_HOST_DIR:/root/.qlib 写入）
+EXTRA_DATA_FILTERED_QLIB="$QDATA_HOST_DIR/qlib_data/cn_extra_data_improve_filtered"
+export TARGET_MARKET="${TARGET_MARKET:-all}"
+export TARGET_BENCHMARK="${TARGET_BENCHMARK:-SH000300}"
+# AlphaExtra 专用 YAML 模板
+export WORKFLOW_TEMPLATE="${WORKFLOW_TEMPLATE:-$WORKDIR_IN_CONTAINER/examples/benchmarks/LightGBM/workflow_config_lightgbm_AlphaExtra.yaml}"
+
+# 实盘账户参数
+export CASH_TOTAL=30000
+export TX_FEE_RATE=0.0001
+export STAMP_DUTY_RATE=0.0005
+export HOLD_NUM=5
+
+# Walk-forward 参数
+export SAMPLE_WEIGHT_HALF_LIFE="${SAMPLE_WEIGHT_HALF_LIFE:-252}"
+export WALK_FORWARD_STEP_YEARS="${WALK_FORWARD_STEP_YEARS:-1}"
+export WALK_FORWARD_STEP_WEEKS="${WALK_FORWARD_STEP_WEEKS:-0}"
+export WALK_FORWARD_TEST_YEARS="${WALK_FORWARD_TEST_YEARS:-2}"
+export WALK_FORWARD_TEST_WEEKS="${WALK_FORWARD_TEST_WEEKS:-52}"
+export WALK_FORWARD_SEGMENT_YEARS="${WALK_FORWARD_SEGMENT_YEARS:-1}"
+export WALK_FORWARD_HISTORY_YEARS="${WALK_FORWARD_HISTORY_YEARS:-6}"
+export TRAIN_YEARS="${TRAIN_YEARS:-2}"
+export VALID_YEARS="${VALID_YEARS:-1}"
+
+# Full backtest 仅回放最近一年
+export FULL_BACKTEST_REPLAY_YEARS="${FULL_BACKTEST_REPLAY_YEARS:-1}"
+
+# ──────────────────────────────────────────────
+# 2. 日期计算
+# ──────────────────────────────────────────────
+_date_offset() {
+  local base="$1" days="$2"
+  if date --version >/dev/null 2>&1; then
+    date -d "$base $days days" +%Y-%m-%d
+  else
+    local flag
+    if (( days >= 0 )); then flag="+${days}d"; else flag="${days}d"; fi
+    date -j -v"$flag" -f "%Y-%m-%d" "$base" +%Y-%m-%d
+  fi
+}
+
+_date_offset_years() {
+  local base="$1" years="$2"
+  if date --version >/dev/null 2>&1; then
+    date -d "$base $years years" +%Y-%m-%d
+  else
+    local flag
+    if (( years >= 0 )); then flag="+${years}y"; else flag="${years}y"; fi
+    date -j -v"$flag" -f "%Y-%m-%d" "$base" +%Y-%m-%d
+  fi
+}
+
+_this_friday() {
+  local today dow diff
+  today="$(date +%Y-%m-%d)"
+  dow="$(date +%u)"
+  diff=$(( 5 - dow ))
+  if (( diff < 0 )); then diff=$(( diff + 7 )); fi
+  _date_offset "$today" "$diff"
+}
+
+T="$(_this_friday)"
+
+# cn_extra_data 日历
+DATA_CALENDAR_FILE="$QDATA_HOST_DIR/qlib_data/cn_extra_data_improve/calendars/day.txt"
+DATA_LATEST_DATE=""
+if [[ -f "$DATA_CALENDAR_FILE" ]]; then
+  DATA_LATEST_DATE="$(tail -1 "$DATA_CALENDAR_FILE" | tr -d '\r')"
+fi
+
+# cn_extra_data_improve 数据起点 (2020-01-02)
+TRAIN_BASE_START="2020-01-01"
+WALK_FORWARD_START_DATE="${WALK_FORWARD_START_DATE:-2020-01-01}"
+
+TARGET_TEST_END="$(_date_offset "$T" -1)"
+if [[ -n "$DATA_LATEST_DATE" && "$TARGET_TEST_END" > "$DATA_LATEST_DATE" ]]; then
+  TEST_END="$DATA_LATEST_DATE"
+else
+  TEST_END="$TARGET_TEST_END"
+fi
+
+# 防止回测日历越界：backtest end_time 不能等于最后一天，
+# 否则 qlib/backtest/utils.py get_step_time 访问 calendar[last+1] 会 IndexError
+if [[ "$TEST_END" == "$DATA_LATEST_DATE" ]]; then
+  TEST_END=$(tail -2 "$DATA_CALENDAR_FILE" | head -1 | tr -d '\r')
+fi
+
+# cn_extra_data 只有 ~6 年数据，调整窗口大小
+TEST_START="$(_date_offset_years "$TEST_END" -2)"
+VALID_END="$(_date_offset "$TEST_START" -1)"
+VALID_START="$(_date_offset_years "$VALID_END" -1)"
+TRAIN_END="$(_date_offset "$VALID_START" -1)"
+TRAIN_START="$TRAIN_BASE_START"
+PRED_DATE="$TEST_END"
+
+export T TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END PRED_DATE
+export WALK_FORWARD_START_DATE WALK_FORWARD_END_DATE="${WALK_FORWARD_END_DATE:-$PRED_DATE}"
+export TRAIN_BASE_START EXP_NAME OUT_DIR SCRIPT_DIR DOCKER_IMAGE WORKDIR_IN_CONTAINER QDATA_HOST_DIR OUT_DIR_IN_CONTAINER
+
+# 创建输出目录
+mkdir -p "$LOG_DIR"
+mkdir -p "$OUT_DIR/data_health"
+mkdir -p "$OUT_DIR/model_predict"
+
+echo "============================================================"
+echo "  run_new_factor_practice (AlphaExtra)"
+echo "  experiment : $EXP_NAME"
+echo "  market     : $TARGET_MARKET"
+echo "  benchmark  : $TARGET_BENCHMARK"
+echo "  T (本周五) : $T"
+if [[ -n "$DATA_LATEST_DATE" ]]; then
+  echo "  数据最新日 : $DATA_LATEST_DATE"
+fi
+echo "  训练集     : $TRAIN_START ~ $TRAIN_END"
+echo "  验证集     : $VALID_START ~ $VALID_END"
+echo "  测试集     : $TEST_START ~ $TEST_END"
+echo "  预测日期   : $PRED_DATE"
+echo "  滚动起点   : $WALK_FORWARD_START_DATE"
+echo "  滚动终点   : $WALK_FORWARD_END_DATE"
+echo "  stage      : $START_STAGE → $END_STAGE"
+echo "  output     : $OUT_DIR"
+echo "  miss_thresh: $MISSING_THRESHOLD"
+echo "============================================================"
+
+# ──────────────────────────────────────────────
+# Stage 1: 数据健康检查 & 缺失值过滤
+# ──────────────────────────────────────────────
+run_stage1() {
+  echo ""
+  echo "╔══════════════════════════════════════════╗"
+  echo "║  STAGE 1 — 数据健康检查 (AlphaExtra)     ║"
+  echo "╚══════════════════════════════════════════╝"
+  local log="$LOG_DIR/stage1.log"
+
+  (
+    set -euo pipefail
+
+    local SOURCE_CONTAINER="/root/.qlib/qlib_data/cn_extra_data_improve"
+    local FILTERED_CONTAINER="/root/.qlib/qlib_data/cn_extra_data_improve_filtered"
+    # Stage2 会将过滤数据挂载到原始路径，因此 symlink 需指向一个独立的数据源路径
+    local FEATURES_SOURCE_CONTAINER="/root/.qlib/qlib_data/cn_extra_data_improve_source"
+    local OUT_CONTAINER="$OUT_DIR_IN_CONTAINER/data_health"
+
+    echo "[1/3] 检查数据缺失率 (threshold: $MISSING_THRESHOLD)"
+    docker run --rm \
+      -e TARGET_MARKET \
+      -v "$SCRIPT_DIR:$WORKDIR_IN_CONTAINER" \
+      -v "$QDATA_HOST_DIR:/root/.qlib" \
+      -v "$EXTRA_DATA_HOST:$SOURCE_CONTAINER" \
+      -w "$WORKDIR_IN_CONTAINER" \
+      "$DOCKER_IMAGE" \
+      python3 scripts/practice/stage1_data_health_extra.py \
+      --source-qlib-dir "$SOURCE_CONTAINER" \
+      --qlib-dir "$FILTERED_CONTAINER" \
+      --output "$OUT_CONTAINER" \
+      --market "$TARGET_MARKET" \
+      --missing-threshold "$MISSING_THRESHOLD" \
+      --features-source "$FEATURES_SOURCE_CONTAINER"
+
+    echo "[2/3] 链接过滤后的数据到 host"
+    if [[ -d "$FILTERED_CONTAINER" || -L "$FILTERED_CONTAINER" ]]; then
+      # 容器写入了过滤数据在 /root/.qlib/qlib_data/cn_extra_data_improve_filtered
+      # host 通过 -v "$QDATA_HOST_DIR:/root/.qlib" 把数据写到了 $QDATA_HOST_DIR/qlib_data/
+      true  # 数据已经在 host 上了
+    fi
+    if [[ ! -d "$EXTRA_DATA_FILTERED_QLIB" ]]; then
+      echo "✗ 过滤后的数据未生成: $EXTRA_DATA_FILTERED_QLIB" >&2
+      exit 1
+    fi
+
+    echo "[3/3] Stage1 完成"
+    # 统计过滤结果
+    local summary="$OUT_DIR/data_health/stage1_summary.json"
+    if [[ -f "$summary" ]]; then
+      python3 -c "
+import json
+with open('$summary') as f:
+    s = json.load(f)
+print(f\"  总股票数: {s['total_stocks_checked']}\")
+print(f\"  过滤掉: {s['excluded_count']} 只\")
+print(f\"  剩余: {s['total_stocks_checked'] - s['excluded_count']} 只\")
+print(f\"  缺失率阈值: {s['missing_threshold']}\")
+print(f\"  缺失率均值: {s['missing_ratio_stats']['mean']:.4f}\")
+print(f\"  缺失率中位数: {s['missing_ratio_stats']['median']:.4f}\")
+"
+    fi
+    echo "✓ Stage1 完成 — 过滤数据: $EXTRA_DATA_FILTERED_QLIB"
+  ) 2>&1 | tee "$log"
+}
+
+# ──────────────────────────────────────────────
+# Stage 2: Walk-forward 训练与预测
+# ──────────────────────────────────────────────
+run_stage2() {
+  echo ""
+  echo "╔══════════════════════════════════════════╗"
+  echo "║  STAGE 2 — Walk-forward (AlphaExtra)    ║"
+  echo "╚══════════════════════════════════════════╝"
+  local log="$LOG_DIR/stage2.log"
+
+  (
+    set -euo pipefail
+
+    # 如果 stage1 已生成过滤数据，则将过滤数据挂载到原始路径，
+    # 原始数据挂载到独立的 source 路径供 symlink 引用。
+    local _data_host="$EXTRA_DATA_HOST"
+    local _data_source_mount_args=()
+    if [[ -d "$EXTRA_DATA_FILTERED_QLIB" ]]; then
+      _data_host="$EXTRA_DATA_FILTERED_QLIB"
+      _data_source_mount_args=(-v "$EXTRA_DATA_HOST:/root/.qlib/qlib_data/cn_extra_data_improve_source")
+      echo "  使用过滤后的数据 (${_data_host##*/})"
+    fi
+
+    local PRED_OUT_HOST="$OUT_DIR/model_predict"
+    local PRED_OUT_CONTAINER="$OUT_DIR_IN_CONTAINER/model_predict"
+
+    echo "[1/3] 启动 Docker 容器运行 AlphaExtra walk-forward"
+    # 挂载 handler_extra.py 到容器内 qlib 包目录
+    local HANDLER_EXTRA_SRC="$SCRIPT_DIR/qlib/contrib/data/handler_extra.py"
+    local HANDLER_EXTRA_DST="/workspace/qlib/qlib/contrib/data/handler_extra.py"
+    if [[ ! -f "$HANDLER_EXTRA_SRC" ]]; then
+      echo "✗ handler_extra.py 不存在: $HANDLER_EXTRA_SRC" >&2
+      exit 1
+    fi
+
+    docker run --rm \
+      -e CASH_TOTAL \
+      -e HOLD_NUM \
+      -e TX_FEE_RATE \
+      -e STAMP_DUTY_RATE \
+      -e TARGET_MARKET \
+      -e WALK_FORWARD_STEP_YEARS \
+      -e WALK_FORWARD_STEP_WEEKS \
+      -e WALK_FORWARD_TEST_YEARS \
+      -e WALK_FORWARD_TEST_WEEKS \
+      -e WALK_FORWARD_HISTORY_YEARS \
+      -e WALK_FORWARD_SEGMENT_YEARS \
+      -e WALK_FORWARD_START_DATE \
+      -e WALK_FORWARD_END_DATE \
+      -e FULL_BACKTEST_REPLAY_YEARS \
+      -e PYTHONPATH="$WORKDIR_IN_CONTAINER" \
+      -v "$SCRIPT_DIR:$WORKDIR_IN_CONTAINER" \
+      -v "$QDATA_HOST_DIR:/root/.qlib" \
+      -v "$_data_host:/root/.qlib/qlib_data/cn_extra_data_improve" \
+      "${_data_source_mount_args[@]}" \
+      -v "$HANDLER_EXTRA_SRC:$HANDLER_EXTRA_DST:ro" \
+      -v "$SCRIPT_DIR/qlib/data/storage/file_storage.py:/workspace/qlib/qlib/data/storage/file_storage.py:ro" \
+      -v "$SCRIPT_DIR/qlib/data/ops.py:/workspace/qlib/qlib/data/ops.py:ro" \
+      -w "$WORKDIR_IN_CONTAINER" \
+      "$DOCKER_IMAGE" \
+      python3 scripts/practice/run_stage2_walk_forward_extra.py \
+      --template "$WORKFLOW_TEMPLATE" \
+      --output-root "$PRED_OUT_CONTAINER" \
+      --analysis-root "$WORKDIR_IN_CONTAINER/DATA/analysis_outputs/$EXP_NAME" \
+      --experiment-name "$EXP_NAME" \
+      --uri-folder mlruns \
+      --half-life "$SAMPLE_WEIGHT_HALF_LIFE" \
+      --floor 0.2 \
+      --step-years "$WALK_FORWARD_STEP_YEARS" \
+      --step-weeks "$WALK_FORWARD_STEP_WEEKS" \
+      --test-years "$WALK_FORWARD_TEST_YEARS" \
+      --test-weeks "$WALK_FORWARD_TEST_WEEKS" \
+      --history-years "$WALK_FORWARD_HISTORY_YEARS" \
+      --train-years "$TRAIN_YEARS" \
+      --valid-years "$VALID_YEARS" \
+      --segment-years "$WALK_FORWARD_SEGMENT_YEARS" \
+      --train-base-start "$TRAIN_BASE_START" \
+      --walk-forward-start "$WALK_FORWARD_START_DATE" \
+      --walk-forward-end "$WALK_FORWARD_END_DATE" \
+      --hold-num "$HOLD_NUM" \
+      --model-mode robust
+
+    echo "[2/3] 读取 walk-forward 汇总"
+    if [[ -f "$PRED_OUT_HOST/walk_forward_summary.csv" ]]; then
+      head -20 "$PRED_OUT_HOST/walk_forward_summary.csv"
+    fi
+
+    echo "[3/3] Stage2 完成 — 结果保存在: $PRED_OUT_HOST"
+  ) 2>&1 | tee "$log"
+}
+
+# ──────────────────────────────────────────────
+# 执行调度
+# ──────────────────────────────────────────────
+for stage in $(seq "$START_STAGE" "$END_STAGE"); do
+  case "$stage" in
+    1) run_stage1 ;;
+    2) run_stage2 ;;
+    *) echo "Invalid stage: $stage (supported: 1, 2)" >&2;;
+  esac
+done
+
+echo ""
+echo "============================================================"
+echo "  AlphaExtra 执行完毕"
+echo "  输出目录: $OUT_DIR"
+echo "============================================================"
