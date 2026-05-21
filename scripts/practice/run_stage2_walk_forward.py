@@ -1512,7 +1512,12 @@ def _build_stage36_replay_plan(fold_outputs: list[Path]) -> list[dict[str, objec
                 ),
             }
 
-    return [replay_plan[key] for key in sorted(replay_plan)]
+    plan = [replay_plan[key] for key in sorted(replay_plan)]
+    replay_years = int(os.environ.get("FULL_BACKTEST_REPLAY_YEARS", "0") or "0")
+    if replay_years > 0:
+        cutoff = pd.Timestamp.now() - pd.DateOffset(years=replay_years)
+        plan = [item for item in plan if pd.Timestamp(item["pred_date"]) >= cutoff]
+    return plan
 
 
 def _stage36_replay_signal_from_fold(
