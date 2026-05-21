@@ -5,7 +5,7 @@ description: Automated factor mining pipeline using rdagent fin_factor + DeepSee
 
 # Factor Mining Skill
 
-Automated end-to-end factor discovery pipeline. Reads existing factors from `tushare/new_factor.md`, runs rd-agent fin_factor with DeepSeek-v4-pro to discover new factors, filters by IC/Rank IC quality, and appends unique validated factors.
+Automated end-to-end factor discovery pipeline. Reads existing factors from `tushare/new_factor.md` (passed) and `tushare/fail_new_factor.md` (failed), runs rd-agent fin_factor with DeepSeek-v4-pro to discover new factors, filters by evaluation quality, appends unique validated factors, and records failures to prevent re-mining.
 
 ## Target Factor Categories
 
@@ -30,30 +30,35 @@ Automated end-to-end factor discovery pipeline. Reads existing factors from `tus
 Before each run, verify:
 
 1. **Docker disk space**: Run `docker system prune -af` if disk is near full (>20GB free needed)
-2. **DeepSeek proxy status**: The proxy must be running on `0.0.0.0:18080`. Check with `lsof -i :18080`. If not running, start it (see Step 2).
-3. **Linux Cython modules**: `qlib/data/_libs/rolling.cpython-310-x86_64-linux-gnu.so` must exist. If missing, compile (see Step 3).
-4. **HDF5 source data**: `rdagent_workspace/factor_data_template/daily_pv_all.h5` and `daily_pv_debug.h5` must exist. Run `python rdagent_workspace/factor_data_template/generate.py` if missing.
+2. **DeepSeek API key**: Set `DEEPSEEK_API_KEY` environment variable: `export DEEPSEEK_API_KEY="sk-..."`. The skill reads this variable; never hardcode keys.
+3. **DeepSeek proxy status**: The proxy must be running on `0.0.0.0:18080`. Check with `lsof -i :18080`. If not running, start it (see Step 2).
+4. **Linux Cython modules**: `qlib/data/_libs/rolling.cpython-310-x86_64-linux-gnu.so` must exist. If missing, compile (see Step 3).
+5. **HDF5 source data**: `rdagent_workspace/factor_data_template/daily_pv_all.h5` and `daily_pv_debug.h5` must exist. Run `python rdagent_workspace/factor_data_template/generate.py` if missing.
 
 ## Step-by-Step Workflow
 
-### Step 1: Read existing factors and determine target categories
+### Step 1: Read existing factors (both passed AND failed) and determine target categories
 
-Read `tushare/new_factor.md` to extract all existing factor names, types, and formulations. Build a dedup set:
+Read **both** `tushare/new_factor.md` (passed factors) and `tushare/fail_new_factor.md` (failed factors) to build a comprehensive dedup set. The goal is to avoid wasting LLM resources on factors that have already been tried — whether they passed or failed.
 
 ```bash
-# Extract all factor names from new_factor.md
+# Extract all passed factor names from new_factor.md
 grep -E '^## [0-9]+\. ' tushare/new_factor.md | sed 's/^## [0-9]*\. //'
+
+# Extract all failed factor names from fail_new_factor.md
+grep -E '^## [0-9]+\. ' tushare/fail_new_factor.md 2>/dev/null | sed 's/^## [0-9]*\. //'
 
 # Extract all known factor names from previous run logs
 grep -ohP 'factor_name: \K[^\n]+' factors_results_round*.txt 2>/dev/null | sort -u
 ```
 
-Build a **dedup registry** with:
+Build a **dedup registry** that covers BOTH passed and failed factors:
 - Factor names (case-insensitive, normalize `_`/`-`/space to single separator)
 - Factor formulations (normalize whitespace, remove LaTeX formatting, compare semantically)
 - Concept fingerprints (e.g., "20-day price change ratio" → momentum family, window=20)
+- **IMPORTANT**: A factor that already failed is just as important to avoid as one that already passed. Both waste LLM resources if re-proposed.
 
-**Determine which categories are uncovered.** Cross-reference existing factors against the target categories table above. Prioritize categories with zero coverage.
+**Determine which categories are uncovered.** Cross-reference existing factors (passed + failed) against the target categories table above. Prioritize categories with zero coverage.
 
 ### Step 2: Start DeepSeek API proxy (if not running)
 
@@ -134,7 +139,7 @@ docker run --rm \
   --dns 8.8.8.8 --dns 114.114.114.114 \
   -e PYTHONPATH="$HOST_PWD" \
   -e DOCKER_HOST=unix:///var/run/docker.sock \
-  -e OPENAI_API_KEY=YOUR_API_KEY \
+  -e OPENAI_API_KEY="${DEEPSEEK_API_KEY:?err:请先 export DEEPSEEK_API_KEY="sk-..."}" \
   -e CHAT_MODEL='openai/deepseek-v4-pro' \
   -e OPENAI_API_BASE="http://${HOST_IP}:18080/v1" \
   -e CONDA_DEFAULT_ENV=qlib_env \
@@ -158,9 +163,9 @@ docker run --rm \
 
 **Targeting specific categories:** The LLM proposes factors based on available data columns. rdagent's feedback loop naturally diversifies across loops. For best coverage of missing categories, run with higher `--loop-n` (3-5) to give more exploration chances.
 
-### Step 6: Parse results and extract passing factors
+### Step 6: Parse results — extract BOTH passing and failing factors
 
-After fin_factor completes, extract all passing factors from the output file:
+After fin_factor completes, extract all factors and their evaluation results from the output file:
 
 ```bash
 OUTPUT_FILE="factors_results_YYYYMMDD_HHMM.txt"  # replace with actual
@@ -171,9 +176,13 @@ grep -oP 'factor_name: \K\S+' "$OUTPUT_FILE" | sort -u
 # 2. Get evaluation results - find all "Final decisions:" lines
 grep -oP 'Final decisions: \[.*?\] True count: \d+' "$OUTPUT_FILE"
 
-# 3. Extract full factor details for each passing factor
+# 3. Extract full factor details for ALL factors (both passing and failing)
 # Each factor appears as a block with: factor_name, factor_description, factor_formulation, variables
 grep -A3 'factor_name: ' "$OUTPUT_FILE" | grep -v '^--$'
+
+# 4. For each factor, determine if it passed (final_decision: True in its LAST evaluation)
+# Factors that appear with final_decision: False and never later appear with True → FAILED
+# Factors that appear with final_decision: True → PASSED
 ```
 
 **How to read evaluation results:**
@@ -186,16 +195,20 @@ grep -A3 'factor_name: ' "$OUTPUT_FILE" | grep -v '^--$'
   ```
 - Each block is followed by execution feedback and a JSON `{"final_decision": true/false, ...}`
 - `final_decision: True` means the code ran correctly and output format is valid
+- `final_decision: False` means the factor failed (code error, wrong output format, or invalid values)
 - `Final decisions: [True, False, True, ...] True count: N` means N out of M factors passed in that batch
+- A factor may appear multiple times across loops; its **last** decision is what matters
+
+**Track failures carefully.** Factors with `final_decision: False` must be recorded in `tushare/fail_new_factor.md` so they are not re-proposed in future runs.
 
 ### Step 7: Filter and deduplicate
 
 **Quality criteria for accepting a factor (ALL must pass):**
 
 1. **final_decision == True** — code executed without error, output format is correct (MultiIndex [datetime, instrument], single float64 column)
-2. **Not a duplicate** of any existing factor in `tushare/new_factor.md`
+2. **Not a duplicate** of any existing factor in `tushare/new_factor.md` OR `tushare/fail_new_factor.md`
 
-**Dedup rules (apply in order):**
+**Dedup rules (apply in order, check against BOTH new_factor.md AND fail_new_factor.md):**
 1. Exact name match (case-insensitive, after normalizing `_`/`-`)
 2. Same formula with different variable naming → DUPLICATE
 3. Same underlying concept + same window → DUPLICATE (e.g., `momentum_20d` = `MediumTermMomentum_20d` = `20d_return`)
@@ -231,7 +244,7 @@ For each qualifying factor, append to `tushare/new_factor.md` in this format:
 ---
 ```
 
-**Rules for appending:**
+**Rules for appending to new_factor.md:**
 - Increment the section number (`N`) from the last existing factor
 - Add the new entry before the `## 使用方法` section
 - Update the summary table at the top of the file: add a row for each new factor
@@ -239,7 +252,32 @@ For each qualifying factor, append to `tushare/new_factor.md` in this format:
 - Keep the LaTeX clean and well-formatted
 - Link variables to their cn_extra_data field names (e.g., `$pe_ttm`)
 
-### Step 9: Cleanup
+### Step 9: Record failed factors in fail_new_factor.md
+
+For each factor that received `final_decision: False` in its last evaluation, append to `tushare/fail_new_factor.md` in this format:
+
+```markdown
+## N. factor_name
+
+- **类型**：<Chinese category label>
+- **描述**：<One-line description of what the factor measures>
+- **公式**：
+
+  $$<LaTeX formula>$$
+
+- **失败原因**：final_decision: False — <code error / output format incorrect / invalid values / etc.>
+- **日期**：YYYY-MM-DD
+---
+```
+
+**Rules for appending to fail_new_factor.md:**
+- Increment the section number (`N`) from the last existing failed factor
+- Update the summary table at the top: add a row with factor name, type, failure reason, and date
+- Only record a failed factor ONCE — if it already appears in `fail_new_factor.md`, do not duplicate; update the existing entry's date and reason if they changed
+- A factor that previously failed but now passes should be REMOVED from `fail_new_factor.md` and added to `new_factor.md`
+- **Before appending, check**: is this failed factor actually a duplicate (by name/formula/concept) of an existing failed factor? If so, skip or update the existing entry
+
+### Step 10: Cleanup
 
 ```bash
 # Stop the proxy (or leave it running for the next mining session)
@@ -259,23 +297,24 @@ docker system prune -af
 | Disk full | Docker daemon error / exit 1 | `docker system prune -af` |
 | Embedding API 404 | DeepSeek has no embedding endpoint | Already stubbed in `sitecustomize.py` |
 | Same factors every run | LLM re-proposes similar factors | Increase `--loop-n` to 3-5 for more exploration diversity |
+| Same FAILED factors re-proposed | LLM keeps trying already-failed factors | Ensure `fail_new_factor.md` is up to date; add explicit "DO NOT propose" instructions in the prompt |
 | All factors rejected | `True count: 0` in final decisions | Check if Cython modules are compiled; verify proxy connectivity |
 | Proxy port conflict | `Address already in use` | `lsof -i :18080` and kill existing process |
 | HDF5 data missing | `daily_pv_all.h5 not found` | Run `python rdagent_workspace/factor_data_template/generate.py` |
 
 ## Progress Tracking
 
-Update this table after each successful run. Mark categories with factors:
+Update this table after each successful run. Mark categories with factors. Failed factors (tracked in `fail_new_factor.md`) also count toward category coverage — a category is "DONE" when it has at least one passing factor.
 
 | Category | Status | Factors discovered |
 |----------|--------|--------------------|
-| 动量/反转 | DONE | MediumTermMomentum_20d, 20_day_reversal, momentum_5d, reversal_1d |
-| 波动率 | DONE | RealizedVolatility_20d, intraday_volatility |
+| 动量/反转 | DONE | MediumTermMomentum_20d, 20_day_reversal, momentum_5d, reversal_1d, momentum_10d, reversal_2d |
+| 波动率 | DONE | RealizedVolatility_20d, intraday_volatility, avg_normalized_range_5d |
 | 震荡 | DONE | RSI_14d |
-| 流动性 | DONE | 5_day_volume_change, volume_ratio_5d |
-| 估值 | DONE | trailing_PE_ratio, earnings_yield |
-| 量价 | DONE | obv_slope_10day, volume_weighted_momentum_5d |
-| 风险调整 | DONE | sharpe_10day |
+| 流动性 | DONE | 5_day_volume_change, volume_ratio_5d, turnover_trend, avg_volume_ratio_20d |
+| 估值 | DONE | trailing_PE_ratio, earnings_yield, PB_Ratio, Sector_Relative_PB, book_to_price |
+| 量价 | DONE | obv_slope_10day, volume_weighted_momentum_5d, vwap_deviation_10d, vwap_deviation_5d |
+| 风险调整 | DONE | sharpe_10day, Momentum_Vol_Adjusted_20, risk_adjusted_momentum_5d_20d |
 | 质量 | DONE | roe, net_profit_margin |
 | 成长 | TODO | EPS/revenue/BPS growth factors needed |
 | 财务杠杆 | TODO | debt/assets, liability/equity factors needed |
@@ -283,3 +322,11 @@ Update this table after each successful run. Mark categories with factors:
 | 市值/规模 | TODO | total_mv, circ_mv factors needed |
 | 股息 | TODO | dv_ratio, dv_ttm factors needed |
 | 运营效率 | DONE | net_profit_margin (also covers 质量) |
+
+## Related Files
+
+| File | Purpose |
+|------|---------|
+| `tushare/new_factor.md` | All factors that **passed** evaluation — used in production |
+| `tushare/fail_new_factor.md` | All factors that were **proposed but failed** — used for dedup only |
+| `factors_results_*.txt` | Raw rdagent output logs from each mining run |
