@@ -358,7 +358,7 @@ class FileFeatureStorage(FileStorageMixin, FeatureStorage):
             if isinstance(i, int):
                 if storage_start_index > i:
                     raise IndexError(f"{i}: start index is {storage_start_index}")
-                fp.seek(4 * (i - storage_start_index) + 4)
+                fp.seek(int(4 * (int(i) - int(storage_start_index)) + 4))
                 return i, struct.unpack("f", fp.read(4))[0]
             elif isinstance(i, slice):
                 start_index = storage_start_index if i.start is None else i.start
@@ -366,7 +366,7 @@ class FileFeatureStorage(FileStorageMixin, FeatureStorage):
                 si = max(start_index, storage_start_index)
                 if si > end_index:
                     return pd.Series(dtype=np.float32)
-                fp.seek(4 * (si - storage_start_index) + 4)
+                fp.seek(int(4 * (int(si) - int(storage_start_index)) + 4))
                 # read n bytes
                 count = end_index - si + 1
                 data = np.frombuffer(fp.read(4 * count), dtype="<f")
