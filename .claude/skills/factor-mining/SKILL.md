@@ -9,21 +9,23 @@ Automated end-to-end factor discovery pipeline. Reads existing factors from `tus
 
 ## Target Factor Categories
 
-| Category | Chinese Label | Examples | Key cn_extra_data fields |
-|----------|---------------|----------|--------------------------|
-| Value | 估值 | PE, PB, PS, earnings yield | `$pe_ttm`, `$pb`, `$ps_ttm`, `$pe` |
-| Quality | 质量 | ROE, ROA, profit margin, npta | `$roe_yearly`, `$roa_yearly`, `$netprofit_margin`, `$npta` |
-| Growth | 成长 | EPS growth, revenue growth, BPS growth | `$eps_yoy`, `$revenue_yoy`, `$bps_yoy`, `$netprofit_yoy`, `$assets_yoy` |
-| Momentum/Reversal | 动量/反转 | price momentum, reversal | `$close`, `$adjclose`, `$vwap` |
-| Low Volatility | 低波动 | realized vol, variance | `$close` (computed) |
-| Liquidity | 流动性 | turnover, volume ratio, amount | `$turnover`, `$turnover_f`, `$volume`, `$vol_ratio`, `$amount` |
-| Financial Leverage | 财务杠杆 | debt/equity, debt/assets | `$debt_to_assets`, `$liab_to_eqty`, `$assets_to_eqt` |
-| Cash Flow | 现金流 | OCF, FCF, CFPS, OCF/profit | `$ocf`, `$fcf`, `$icf`, `$cfps`, `$ocfps`, `$ocf_to_profit`, `$ocf_to_assets` |
-| Market Cap/Size | 市值/规模 | total MV, circ MV, shares | `$total_mv`, `$circ_mv`, `$total_sh`, `$float_sh`, `$free_sh` |
-| Dividend | 股息 | dividend yield, dv TTM | `$dv_ratio`, `$dv_ttm` |
-| Operating Efficiency | 运营效率 | op/revenue, revenue PS | `$op_to_revenue`, `$revenue_ps`, `$operate_profit` |
-| Volume-Price | 量价 | OBV, VWAP-based, MFI | `$volume`, `$close`, `$vwap`, `$amount` |
-| Risk-Adjusted | 风险调整 | Sharpe, Sortino, Information ratio | `$close` (computed) |
+| Category | Chinese Label | Alpha158 覆盖 | Examples | Key cn_extra_data fields |
+|----------|---------------|---------------|----------|--------------------------|
+| Value | 估值 | 无 | PE, PB, PS, earnings yield | `$pe_ttm`, `$pb`, `$ps_ttm`, `$pe` |
+| Quality | 质量 | 无 | ROE, ROA, profit margin, npta | `$roe_yearly`, `$roa_yearly`, `$netprofit_margin`, `$npta` |
+| Growth | 成长 | 无 | EPS growth, revenue growth, BPS growth | `$eps_yoy`, `$revenue_yoy`, `$bps_yoy`, `$netprofit_yoy`, `$assets_yoy` |
+| Momentum/Reversal | 动量/反转 | ROC5-60, 已覆盖基础 | price momentum, reversal | `$close`, `$adjclose`, `$vwap` |
+| Low Volatility | 低波动 | STD, 部分覆盖 | realized vol, variance | `$close` (computed) |
+| Liquidity | 流动性 | VMA, VSTD, 已覆盖基础 | turnover, volume ratio, amount | `$turnover`, `$turnover_f`, `$volume`, `$vol_ratio`, `$amount` |
+| Financial Leverage | 财务杠杆 | 无 | debt/equity, debt/assets | `$debt_to_assets`, `$liab_to_eqty`, `$assets_to_eqt` |
+| Cash Flow | 现金流 | 无 | OCF, FCF, CFPS, OCF/profit | `$ocf`, `$fcf`, `$icf`, `$cfps`, `$ocfps`, `$ocf_to_profit`, `$ocf_to_assets` |
+| Market Cap/Size | 市值/规模 | 无 | total MV, circ MV, shares | `$total_mv`, `$circ_mv`, `$total_sh`, `$float_sh`, `$free_sh` |
+| Dividend | 股息 | 无 | dividend yield, dv TTM | `$dv_ratio`, `$dv_ttm` |
+| Operating Efficiency | 运营效率 | 无 | op/revenue, revenue PS | `$op_to_revenue`, `$revenue_ps`, `$operate_profit` |
+| Volume-Price | 量价 | CORR, CORD, 部分覆盖 | OBV, VWAP-based, MFI | `$volume`, `$close`, `$vwap`, `$amount` |
+| Risk-Adjusted | 风险调整 | 无 | Sharpe, Sortino, Information ratio | `$close` (computed) |
+
+> **Alpha158 覆盖说明**: 动量/反转 (ROC, RSV, RANK)、波动率 (STD, QTLU/D)、流动性 (VMA, VSTD)、量价 (CORR, CORD, WVMA) 等 Alpha158 已有基础覆盖。Factor mining 优先挖掘 **Alpha158 无法覆盖的维度**：估值、质量、成长、财务杠杆、现金流、市值/规模、股息、运营效率、风险调整。
 
 ## Prerequisites
 
@@ -33,7 +35,7 @@ Before each run, verify:
 2. **DeepSeek API key**: Set `DEEPSEEK_API_KEY` environment variable: `export DEEPSEEK_API_KEY="sk-..."`. The skill reads this variable; never hardcode keys.
 3. **DeepSeek proxy status**: The proxy must be running on `0.0.0.0:18080`. Check with `lsof -i :18080`. If not running, start it (see Step 2).
 4. **Linux Cython modules**: `qlib/data/_libs/rolling.cpython-310-x86_64-linux-gnu.so` must exist. If missing, compile (see Step 3).
-5. **HDF5 source data**: `rdagent_workspace/factor_data_template/daily_pv_all.h5` and `daily_pv_debug.h5` must exist. Run `python rdagent_workspace/factor_data_template/generate.py` if missing.
+5. **HDF5 source data**: `rdagent_workspace/factor_data_template/daily_pv_all.h5` and `daily_pv_debug.h5` must exist. Generated directly from `tushare/extra_data/` CSV files (5525 stocks, 58 fields). Run `python generate.py` if missing.
 
 ## Step-by-Step Workflow
 
@@ -42,8 +44,9 @@ Before each run, verify:
 Read **both** `tushare/new_factor.md` (passed factors) and `tushare/fail_new_factor.md` (failed factors) to build a comprehensive dedup set. The goal is to avoid wasting LLM resources on factors that have already been tried — whether they passed or failed.
 
 ```bash
-# Extract all passed factor names from new_factor.md
-grep -E '^## [0-9]+\. ' tushare/new_factor.md | sed 's/^## [0-9]*\. //'
+# Extract all passed factor names from new_factor.md (strip `[+Alpha158]` / `[独立]` tags)
+grep -E '^### [0-9]+\. ' tushare/new_factor.md | \
+  sed -E 's/^### [0-9]+\. //; s/ `?\[\+Alpha158[^]]*\]`?//g; s/ `?\[独立\]`?//g'
 
 # Extract all failed factor names from fail_new_factor.md
 grep -E '^## [0-9]+\. ' tushare/fail_new_factor.md 2>/dev/null | sed 's/^## [0-9]*\. //'
@@ -116,13 +119,19 @@ setup(ext_modules=cythonize(ext,language_level='3'),script_args=['build_ext','--
 fi
 ```
 
-### Step 4: Ensure HDF5 source data exists
+### Step 4: Regenerate HDF5 source data
+
+Regenerate HDF5 from the latest `tushare/extra_data/` CSV files (58 fields, no qlib dependency). The `generate.py` reads CSVs directly, aligns to a common calendar, and builds `daily_pv_all.h5` + `daily_pv_debug.h5`.
 
 ```bash
-cd rdagent_workspace/factor_data_template
-if [ ! -f daily_pv_all.h5 ] || [ ! -f daily_pv_debug.h5 ]; then
-  python generate.py
+# Verify extra_data exists
+if [ ! -d tushare/extra_data ]; then
+  echo "ERROR: extra_data not found. Run: bash tushare/check_health.py first, or manually create extra_data directory"
+  exit 1
 fi
+
+cd rdagent_workspace/factor_data_template
+python generate.py
 cd -
 ```
 
@@ -140,7 +149,7 @@ docker run --rm \
   -e PYTHONPATH="$HOST_PWD" \
   -e DOCKER_HOST=unix:///var/run/docker.sock \
   -e OPENAI_API_KEY="${DEEPSEEK_API_KEY:?err:请先 export DEEPSEEK_API_KEY="sk-..."}" \
-  -e CHAT_MODEL='openai/deepseek-v4-pro' \
+  -e CHAT_MODEL='openai/deepseek-v4-flash' \
   -e OPENAI_API_BASE="http://${HOST_IP}:18080/v1" \
   -e CONDA_DEFAULT_ENV=qlib_env \
   -e RDAGENT_MAX_ROUNDS=15 \
@@ -150,16 +159,18 @@ docker run --rm \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -w "$HOST_PWD" \
   zhuhai123/qlib-rdagent:v1 \
-  rdagent fin_factor --step-n 20 --loop-n 3 \
+  rdagent fin_factor --step-n 5 --loop-n 2 \
   2>&1 | tee "factors_results_${TIMESTAMP}.txt"
 ```
+
+**Existing factor avoidance:** `sitecustomize.py` (loaded via `PYTHONPATH`) automatically injects factors from `tushare/new_factor.md` and `tushare/fail_new_factor.md` into the LLM prompt at runtime, instructing the model not to re-propose them. A hard dedup filter in `convert_response()` also catches any duplicates that slip through. No additional configuration needed.
 
 **Parameter guide:**
 | Scenario | `--loop-n` | `--step-n` | Expected time |
 |----------|-----------|-----------|---------------|
-| Quick test / 1-2 categories | 1 | 10 | ~30 min |
-| Normal run / 3-5 categories | 2-3 | 15-20 | ~60-90 min |
-| Full sweep / all remaining | 3-5 | 20-30 | ~2-3 hours |
+| Quick test / 1-2 categories | 1 | 5 | ~15 min |
+| Normal run / 3-5 categories | 2 | 5-10 | ~30-45 min |
+| Full sweep / all remaining | 3 | 10-15 | ~1-1.5 hours |
 
 **Targeting specific categories:** The LLM proposes factors based on available data columns. rdagent's feedback loop naturally diversifies across loops. For best coverage of missing categories, run with higher `--loop-n` (3-5) to give more exploration chances.
 
@@ -209,12 +220,14 @@ grep -A3 'factor_name: ' "$OUTPUT_FILE" | grep -v '^--$'
 2. **Not a duplicate** of any existing factor in `tushare/new_factor.md` OR `tushare/fail_new_factor.md`
 
 **Dedup rules (apply in order, check against BOTH new_factor.md AND fail_new_factor.md):**
+0. **Strip tags before comparing**: Remove `[+Alpha158 XXX]` and `[独立]` tags from factor names in new_factor.md; compare the bare name only
 1. Exact name match (case-insensitive, after normalizing `_`/`-`)
 2. Same formula with different variable naming → DUPLICATE
 3. Same underlying concept + same window → DUPLICATE (e.g., `momentum_20d` = `MediumTermMomentum_20d` = `20d_return`)
 4. Same concept + different window → DIFFERENT factor (e.g., `momentum_5d` ≠ `momentum_20d`)
 5. Different data source for same concept → DIFFERENT (e.g., PE_ttm based ≠ PB based, even if both are value)
 6. If uncertain, compare the actual `factor_formulation` field — normalize whitespace and compare
+7. **Alpha158 overlap check**: Reference the "Alpha158 重叠分析" table in new_factor.md. If the proposed factor is conceptually equivalent to an existing Alpha158 factor (e.g., momentum_Nd ↔ ROC_N, RSI_Nd ↔ SUMP_N, intraday range ↔ KLEN, volume_ratio ↔ VMA), mark as DUPLICATE — Alpha158 already provides the same signal.
 
 **How to check for IC/Rank IC:** The rdagent evaluator's `final_decision: True` already validates:
 - Code execution success
@@ -228,7 +241,7 @@ IC/Rank IC values are computed by the downstream Qlib model training (Stage2 wal
 For each qualifying factor, append to `tushare/new_factor.md` in this format:
 
 ```markdown
-## N. factor_name
+### N. factor_name [TAG]
 
 - **类型**：<Chinese category label from the table above>
 - **描述**：<One-line Chinese+English description of what the factor measures and how to interpret it>
@@ -241,16 +254,15 @@ For each qualifying factor, append to `tushare/new_factor.md` in this format:
   - $var_2$：<description>
 - **数据来源**：cn_extra_data <specific fields used>
 - **评估反馈**：Code execution successful, output format correct (MultiIndex [datetime, instrument], single float64 column), no anomalies in factor values.
+- **Alpha158**：`[独立]` 或 `[+Alpha158 XXX]` — 根据是否与 Alpha158 已有因子重叠选择
 ---
 ```
 
 **Rules for appending to new_factor.md:**
 - Increment the section number (`N`) from the last existing factor
-- Add the new entry before the `## 使用方法` section
-- Update the summary table at the top of the file: add a row for each new factor
-- Update the "经多轮自动化因子挖掘" description if the count changes
-- Keep the LaTeX clean and well-formatted
-- Link variables to their cn_extra_data field names (e.g., `$pe_ttm`)
+- **TAG**: Use `[独立]` if the factor has no Alpha158 equivalent; use `[+Alpha158 XXX]` (e.g., `[+Alpha158 ROC5]`) if it overlaps with an Alpha158 factor — check new_factor.md's "Alpha158 重叠分析" table
+- Add the new entry before the `## Alpha158 完整因子列表` section
+- Update the summary table at the top of the file: add a row for each new factor with the TAG
 
 ### Step 9: Record failed factors in fail_new_factor.md
 
@@ -300,28 +312,28 @@ docker system prune -af
 | Same FAILED factors re-proposed | LLM keeps trying already-failed factors | Ensure `fail_new_factor.md` is up to date; add explicit "DO NOT propose" instructions in the prompt |
 | All factors rejected | `True count: 0` in final decisions | Check if Cython modules are compiled; verify proxy connectivity |
 | Proxy port conflict | `Address already in use` | `lsof -i :18080` and kill existing process |
-| HDF5 data missing | `daily_pv_all.h5 not found` | Run `python rdagent_workspace/factor_data_template/generate.py` |
+| HDF5 data missing | `daily_pv_all.h5 not found` | Run `cd rdagent_workspace/factor_data_template && python generate.py` (reads from extra_data CSV, no qlib needed) |
 
 ## Progress Tracking
 
 Update this table after each successful run. Mark categories with factors. Failed factors (tracked in `fail_new_factor.md`) also count toward category coverage — a category is "DONE" when it has at least one passing factor.
 
-| Category | Status | Factors discovered |
-|----------|--------|--------------------|
-| 动量/反转 | DONE | MediumTermMomentum_20d, 20_day_reversal, momentum_5d, reversal_1d, momentum_10d, reversal_2d |
-| 波动率 | DONE | RealizedVolatility_20d, intraday_volatility, avg_normalized_range_5d |
-| 震荡 | DONE | RSI_14d |
-| 流动性 | DONE | 5_day_volume_change, volume_ratio_5d, turnover_trend, avg_volume_ratio_20d |
-| 估值 | DONE | trailing_PE_ratio, earnings_yield, PB_Ratio, Sector_Relative_PB, book_to_price |
-| 量价 | DONE | obv_slope_10day, volume_weighted_momentum_5d, vwap_deviation_10d, vwap_deviation_5d |
-| 风险调整 | DONE | sharpe_10day, Momentum_Vol_Adjusted_20, risk_adjusted_momentum_5d_20d |
-| 质量 | DONE | roe, net_profit_margin |
-| 成长 | TODO | EPS/revenue/BPS growth factors needed |
-| 财务杠杆 | TODO | debt/assets, liability/equity factors needed |
-| 现金流 | TODO | OCF, FCF, OCF/profit factors needed |
-| 市值/规模 | TODO | total_mv, circ_mv factors needed |
-| 股息 | TODO | dv_ratio, dv_ttm factors needed |
-| 运营效率 | DONE | net_profit_margin (also covers 质量) |
+| Category | Alpha158 基础 | new_factor 独立因子 | Status |
+|----------|---------------|---------------------|--------|
+| 动量/反转 | ROC, RSV, RANK (25) | reversal_1d/2d, momentum_vol_adjusted_20 等 | DONE |
+| 波动率 | STD, QTLU/D, WVMA (25) | RealizedVolatility_20d, avg_normalized_range_5d, Volatility_5d, Volatility_10d | DONE |
+| 震荡 | SUMP/SUMN/SUMD (15) | RSI_14d | DONE |
+| 流动性 | VMA, VSTD, VSUMP/M/D (25) | 5_day_volume_change, turnover_trend, volume_ratio_5d_20d, Liquidity_Turnover_5d, Turnover | DONE |
+| 估值 | 无 | trailing_PE_ratio, PB_Ratio, earnings_yield, book_to_price, Sector_Relative_PB, **PriceToSales** | DONE |
+| 量价 | CORR, CORD (10) | obv_slope_10day, volume_weighted_momentum_5d, vwap_deviation_5d/10d | DONE |
+| 风险调整 | 无 | sharpe_10day, Momentum_Vol_Adjusted_20, risk_adjusted_momentum_5d_20d | DONE |
+| 质量 | 无 | roe, net_profit_margin | DONE |
+| 成长 | 无 | — | TODO |
+| 财务杠杆 | 无 | **DebtToEquity** | **DONE** |
+| 现金流 | 无 | **OperatingCashFlowYield** | **DONE** |
+| 市值/规模 | 无 | Size | DONE |
+| 股息 | 无 | **DividendYield** | **DONE** |
+| 运营效率 | 无 | net_profit_margin, **AssetTurnover** | DONE |
 
 ## Related Files
 

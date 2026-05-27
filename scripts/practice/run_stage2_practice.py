@@ -70,6 +70,249 @@ def _predict_for_segment(model: Model, dataset: Dataset, segment: str):
         dataset.config(segments=original_segments)
 
 
+# ── Factor IC helpers ──────────────────────────────────────────────────
+
+def _get_feature_names(dataset: Dataset) -> list[str] | None:
+    """Try to get feature names from dataset handler's data_loader config."""
+    try:
+        handler = getattr(dataset, "handler", None)
+        if handler is None:
+            return None
+        dl = getattr(handler, "_data_loader", None) or getattr(handler, "data_loader", None)
+        if dl is None:
+            return None
+        # 从 dict 配置中提取
+        if isinstance(dl, dict):
+            feat_cfg = dl.get("kwargs", {}).get("config", {}).get("feature", [])
+            if isinstance(feat_cfg, (list, tuple)) and len(feat_cfg) == 2:
+                return list(feat_cfg[1])
+        # 从 QlibDataLoader 实例的 fields 中提取
+        fields = getattr(dl, "fields", None)
+        if fields is not None:
+            if isinstance(fields, dict):
+                # 优先从 "feature" 分组提取
+                if "feature" in fields:
+                    return list(fields["feature"][1])
+                # 回退: 收集所有分组名称 (但排除 label 分组)
+                names = []
+                for grp_key, (exprs, grp_names) in fields.items():
+                    if grp_key != "label":
+                        names.extend(grp_names)
+                return names if names else None
+            elif isinstance(fields, (list, tuple)) and len(fields) == 2:
+                return list(fields[1])
+    except Exception:
+        pass
+    return None
+
+
+def _materialize_features(dataset: Dataset, segment: str) -> pd.DataFrame:
+    """Convert feature TSDataSampler to DataFrame [datetime, instrument] × features."""
+    sampler = dataset.prepare(segment, col_set="feature", data_key=DataHandlerLP.DK_I)
+
+    # Already a DataFrame
+    if isinstance(sampler, pd.DataFrame):
+        return sampler
+
+    # Fast path: direct numpy access
+    data_arr = getattr(sampler, "data_arr", None)
+    idx = getattr(sampler, "data_idx", None)
+    if data_arr is not None and idx is not None:
+        return pd.DataFrame(data_arr, index=idx)
+
+    # Fallback: iterate via sampler indexing
+    idx = getattr(sampler, "get_index", lambda: None)()
+    n = len(sampler)
+    if n == 0:
+        return pd.DataFrame()
+
+    first = np.asarray(sampler[0]).ravel()
+    n_feats = len(first)
+    data = np.empty((n, n_feats), dtype=np.float64)
+    data[0] = first
+    for i in range(1, n):
+        data[i] = np.asarray(sampler[i]).ravel()[:n_feats]
+
+    if idx is not None:
+        return pd.DataFrame(data, index=idx)
+    return pd.DataFrame(data)
+
+
+def _compute_factor_ic(dataset: Dataset, segment: str) -> pd.DataFrame:
+    """Compute per-factor Rank IC (Spearman) and Pearson IC for a segment.
+
+    Returns DataFrame with columns:
+        factor, mean_RankIC, std_RankIC, IR_RankIC, pos_RankIC,
+        mean_PearsonIC, std_PearsonIC, IR_PearsonIC, pos_PearsonIC, n_dates
+    """
+    feat_df = _materialize_features(dataset, segment)
+    if feat_df.empty:
+        logger.warning("_compute_factor_ic: empty feature data for segment=%s", segment)
+        return pd.DataFrame()
+
+    label_obj = dataset.prepare(segment, col_set="label", data_key=DataHandlerLP.DK_L)
+    label_df = _materialize_label_data(label_obj)
+    if label_df.empty:
+        logger.warning("_compute_factor_ic: empty label data for segment=%s", segment)
+        return pd.DataFrame()
+
+    feat_names = _get_feature_names(dataset)
+    if feat_names is None:
+        # 尝试从 feat_df 自带列名恢复
+        existing_cols = [c for c in feat_df.columns if isinstance(c, str) and c != ""]
+        if existing_cols:
+            feat_names = existing_cols
+        else:
+            feat_names = [f"F{i}" for i in range(feat_df.shape[1])]
+    feat_names = feat_names[: feat_df.shape[1]]
+    feat_df.columns = feat_names
+
+    # Align features and labels on MultiIndex
+    label_col = "label" if "label" in label_df.columns else label_df.columns[0]
+    joined = feat_df.join(label_df[[label_col]], how="inner")
+    if joined.empty:
+        logger.warning("_compute_factor_ic: no overlap between features and labels")
+        return pd.DataFrame()
+
+    factor_cols = [c for c in feat_names if c in joined.columns]
+    if not factor_cols:
+        return pd.DataFrame()
+
+    results = []
+    for factor in factor_cols:
+        daily = joined.groupby(level="datetime").apply(
+            lambda g: pd.Series({
+                "rank_ic": (
+                    g[factor].corr(g[label_col], method="spearman")
+                    if g[factor].notna().sum() >= 5 and g[label_col].notna().sum() >= 5
+                    else np.nan
+                ),
+                "pearson_ic": (
+                    g[factor].corr(g[label_col])
+                    if g[factor].notna().sum() >= 5 and g[label_col].notna().sum() >= 5
+                    else np.nan
+                ),
+            })
+        )
+        rank_ic = daily["rank_ic"].dropna()
+        pearson_ic = daily["pearson_ic"].dropna()
+        n = len(rank_ic)
+
+        results.append({
+            "factor": factor,
+            "mean_RankIC": float(rank_ic.mean()) if n else np.nan,
+            "std_RankIC": float(rank_ic.std(ddof=1)) if n > 1 else np.nan,
+            "IR_RankIC": float(rank_ic.mean() / rank_ic.std(ddof=1)) if n > 1 and rank_ic.std() > 1e-12 else np.nan,
+            "pos_RankIC": float((rank_ic > 0).mean()) if n else np.nan,
+            "mean_PearsonIC": float(pearson_ic.mean()) if n else np.nan,
+            "std_PearsonIC": float(pearson_ic.std(ddof=1)) if n > 1 else np.nan,
+            "IR_PearsonIC": float(pearson_ic.mean() / pearson_ic.std(ddof=1)) if n > 1 and pearson_ic.std() > 1e-12 else np.nan,
+            "pos_PearsonIC": float((pearson_ic > 0).mean()) if n else np.nan,
+            "n_dates": n,
+        })
+
+    df = pd.DataFrame(results)
+    if df.empty:
+        return df
+    return df.sort_values("mean_RankIC", key=abs, ascending=False, na_position="last")
+
+
+def _get_model_feature_importance(model: Model, feature_names: list[str]) -> pd.DataFrame:
+    """Extract LightGBM feature importance (gain + split)."""
+    try:
+        booster = getattr(model, "booster_", None)
+        if booster is None:
+            return pd.DataFrame()
+        gain = booster.feature_importance(importance_type="gain")
+        split = booster.feature_importance(importance_type="split")
+    except Exception:
+        return pd.DataFrame()
+
+    model_names = booster.feature_name()
+    names = model_names if model_names else feature_names[: len(gain)]
+
+    df = pd.DataFrame({
+        "factor": list(names)[: len(gain)],
+        "gain": gain,
+        "split": split,
+    })
+    df["gain_pct"] = df["gain"] / df["gain"].sum() * 100 if df["gain"].sum() > 0 else 0.0
+    df["split_pct"] = df["split"] / df["split"].sum() * 100 if df["split"].sum() > 0 else 0.0
+    return df.sort_values("gain", ascending=False)
+
+
+def _print_factor_ic_report(
+    fic_valid: pd.DataFrame,
+    fic_test: pd.DataFrame,
+    fi: pd.DataFrame,
+    top_n: int = 30,
+) -> None:
+    """Print formatted factor IC report to stdout."""
+
+    def _fmt(v, width=8):
+        if pd.isna(v):
+            return f"{'NaN':>{width}}"
+        return f"{v:>{width}.4f}"
+
+    def _print_table(df: pd.DataFrame, title: str, date_info: str = ""):
+        if df.empty:
+            print(f"  (empty)\n")
+            return
+        n = min(top_n, len(df))
+        print(f"  {title} {date_info}")
+        header = f"  {'Factor':<30s} {'RankIC':>8s} {'RankIR':>8s} {'Pos%':>7s} {'PearIC':>8s} {'PearIR':>8s} {'Pos%':>7s}  n"
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+        for _, row in df.head(n).iterrows():
+            print(
+                f"  {row['factor']:<30s} "
+                f"{_fmt(row.get('mean_RankIC'))} "
+                f"{_fmt(row.get('IR_RankIC'))} "
+                f"{_fmt(row.get('pos_RankIC') * 100 if pd.notna(row.get('pos_RankIC')) else np.nan, 6):>7} "
+                f"{_fmt(row.get('mean_PearsonIC'))} "
+                f"{_fmt(row.get('IR_PearsonIC'))} "
+                f"{_fmt(row.get('pos_PearsonIC') * 100 if pd.notna(row.get('pos_PearsonIC')) else np.nan, 6):>7} "
+                f"{int(row.get('n_dates', 0)):>4d}"
+            )
+        print()
+
+    def _print_fi_table(df: pd.DataFrame):
+        if df.empty:
+            print("  (empty)\n")
+            return
+        n = min(top_n, len(df))
+        print(f"  LightGBM Feature Importance (top {n})")
+        header = f"  {'Factor':<30s} {'gain%':>8s} {'split%':>8s}"
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+        for _, row in df.head(n).iterrows():
+            print(
+                f"  {row['factor']:<30s} "
+                f"{_fmt(row.get('gain_pct'), 7):>8} "
+                f"{_fmt(row.get('split_pct'), 7):>8}"
+            )
+        print()
+
+    print()
+    print("=" * 75)
+    print("  Factor IC Analysis")
+    print("=" * 75)
+
+    # Valid dates info
+    v_info = ""
+    if not fic_valid.empty and "n_dates" in fic_valid.columns:
+        v_info = f"({int(fic_valid['n_dates'].iloc[0])} dates)"
+    _print_table(fic_valid, "Single-Factor IC — Valid", v_info)
+
+    t_info = ""
+    if not fic_test.empty and "n_dates" in fic_test.columns:
+        t_info = f"({int(fic_test['n_dates'].iloc[0])} dates)"
+    _print_table(fic_test, "Single-Factor IC — Test", t_info)
+
+    _print_fi_table(fi)
+    print("=" * 75)
+
+
 def _save_split_predictions(model: Model, dataset: Dataset) -> None:
     valid_pred = _predict_for_segment(model, dataset, "valid")
     valid_label = _materialize_label_data(dataset.prepare("valid", col_set="label", data_key=DataHandlerLP.DK_L))
@@ -171,6 +414,21 @@ def _exe_task(task_config: dict[str, Any], reweighter: TimeDecayReweighter, warm
     dataset.config(dump_all=False, recursive=True)
     R.save_objects(**{"dataset": dataset})
     _save_split_predictions(model, dataset)
+
+    # ── Per-factor IC + feature importance ──
+    try:
+        feat_names = _get_feature_names(dataset)
+        fic_valid = _compute_factor_ic(dataset, "valid")
+        fic_test = _compute_factor_ic(dataset, "test")
+        fi = _get_model_feature_importance(model, feat_names or [])
+        R.save_objects(**{
+            "factor_ic_valid.pkl": fic_valid,
+            "factor_ic_test.pkl": fic_test,
+            "feature_importance.pkl": fi,
+        })
+        _print_factor_ic_report(fic_valid, fic_test, fi)
+    except Exception:
+        logger.exception("Factor IC computation failed, continuing")
 
     placehorder_value = {"<MODEL>": model, "<DATASET>": dataset}
     task_config = fill_placeholder(task_config, placehorder_value)

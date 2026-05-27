@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage1 data health check for AlphaExtra (cn_extra_data_improve).
+"""Stage1 data health check for AlphaExtra (cn_extra_data).
 
 Checks feature completeness by reading binary .day.bin files directly,
 filters stocks with too many missing values, and creates a filtered
@@ -7,8 +7,8 @@ data directory (symlink-based, only instrument lists differ).
 
 Usage (inside container):
     python3 scripts/practice/stage1_data_health_extra.py \
-        --source-qlib-dir /root/.qlib/qlib_data/cn_extra_data_improve \
-        --qlib-dir /root/.qlib/qlib_data/cn_extra_data_improve_filtered \
+        --source-qlib-dir /root/.qlib/qlib_data/cn_extra_data \
+        --qlib-dir /root/.qlib/qlib_data/cn_extra_data_filtered \
         --output /work/DATA/analysis_outputs/<exp>/data_health \
         --market all \
         --missing-threshold 0.5
@@ -17,30 +17,29 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 import os
 import shutil
+import sys
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 
-# Features expected in cn_extra_data_improve (from handler_extra.py direct config + close)
-EXPECTED_FEATURES = frozenset({
-    "close", "pb", "pe_ttm", "roe_yearly", "netprofit_margin",
-    "momentum_5d", "momentum_10d", "momentum_20d",
-    "reversal_1d", "reversal_2d", "reversal_5d", "reversal_20d",
-    "realized_volatility_20d", "intraday_volatility",
-    "avg_normalized_range_5d", "rsi_14d",
-    "volume_change_5d", "volume_ratio_5d", "volume_ratio_5d_20d",
-    "avg_volume_ratio_20d", "turnover_trend",
-    "obv_slope_10d", "volume_weighted_momentum_5d",
-    "vwap_deviation_5d", "vwap_deviation_10d",
-    "sharpe_10d", "momentum_vol_adjusted_20",
-    "risk_adjusted_momentum_5d_20d",
-    "earnings_yield", "book_to_price",
-    "sector_relative_pb",
-})
+def _discover_expected_features(source_features_dir: Path) -> frozenset:
+    """Auto-detect expected features from the first stock's bin files."""
+    stock_dirs = sorted(d for d in source_features_dir.iterdir() if d.is_dir())
+    if not stock_dirs:
+        return frozenset()
+    return frozenset(
+        f.name.replace(".day.bin", "")
+        for f in stock_dirs[0].glob("*.day.bin")
+    )
+
+
+EXPECTED_FEATURES = None  # None = auto-detect at runtime
 
 
 def _normalize_code(code: str) -> str:
@@ -53,7 +52,10 @@ def _normalize_code(code: str) -> str:
 
 def _read_instruments_file(path: Path) -> pd.DataFrame:
     if not path.exists():
-        return pd.DataFrame(columns=["code", "listed_date", "delisted_date"])
+        df = pd.DataFrame(columns=["code", "listed_date", "delisted_date"])
+        df["listed_date"] = pd.to_datetime(df["listed_date"], errors="coerce")
+        df["delisted_date"] = pd.to_datetime(df["delisted_date"], errors="coerce")
+        return df
     df = pd.read_csv(path, sep="\t", header=None, names=["code", "listed_date", "delisted_date"])
     df["code"] = df["code"].astype(str).map(_normalize_code)
     df["listed_date"] = pd.to_datetime(df["listed_date"], errors="coerce")
@@ -147,12 +149,48 @@ def _check_stock(source_features_dir: Path, stock_name: str) -> dict:
     }
 
 
-def _check_all_stocks(source_features_dir: Path, stock_codes: list[str]) -> dict[str, dict]:
-    results = {}
-    for i, code in enumerate(stock_codes):
-        results[code] = _check_stock(source_features_dir, code)
-        if (i + 1) % 500 == 0:
-            print(f"  ... checked {i + 1}/{len(stock_codes)} stocks")
+def _check_stock_worker(args: tuple[str, Path, frozenset]) -> tuple[str, dict]:
+    """Multiprocessing worker: check one stock."""
+    code, source_features_dir, expected_features = args
+    # Restore global for this worker process
+    global EXPECTED_FEATURES
+    EXPECTED_FEATURES = expected_features
+    return code, _check_stock(source_features_dir, code)
+
+
+def _check_all_stocks(
+    source_features_dir: Path,
+    stock_codes: list[str],
+    workers: int = 4,
+) -> dict[str, dict]:
+    """Check all stocks for missing data, using multiprocessing.
+
+    Args:
+        workers: Number of parallel worker processes (0 = auto-detect).
+    """
+    n_workers = workers if workers > 0 else min(multiprocessing.cpu_count(), 8)
+    total = len(stock_codes)
+
+    # Package arguments for each worker: (code, features_dir, expected_features)
+    work_items = [(code, source_features_dir, EXPECTED_FEATURES) for code in stock_codes]
+
+    results: dict[str, dict] = {}
+    print(f"  Parallel check: {total} stocks, {n_workers} workers")
+
+    with multiprocessing.Pool(processes=n_workers) as pool:
+        chunk_size = max(1, total // (n_workers * 50))
+        for i, (code, result) in enumerate(
+            pool.imap_unordered(_check_stock_worker, work_items, chunksize=chunk_size), start=1
+        ):
+            results[code] = result
+            if i % 500 == 0 or i == total:
+                print(f"  ... checked {i}/{total} stocks", flush=True)
+            elif i % 50 == 0:
+                print(f"  ... checked {i}/{total} stocks", end="\r", flush=True)
+        # Ensure a clean newline after \r progress updates
+        if total % 500 != 0:
+            print(flush=True)
+
     return results
 
 
@@ -199,7 +237,12 @@ def _build_filtered_qlib_dir(
     instruments_dst.mkdir(parents=True, exist_ok=True)
 
     all_df = _read_instruments_file(instruments_src / "all.txt")
-    market_df = _read_instruments_file(instruments_src / f"{market}.txt")
+
+    market_file = instruments_src / f"{market}.txt"
+    market_df = _read_instruments_file(market_file)
+    if market_df.empty and not all_df.empty and not market_file.exists():
+        print(f"  {market}.txt 不存在, 使用 all.txt 代替 (股票数: {len(all_df)})")
+        market_df = all_df.copy()
 
     # Filter by missing ratio
     excluded_codes = {code for code, r in results.items() if r["missing_ratio"] > threshold}
@@ -239,13 +282,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Stage1 data health check and filtered-data builder for AlphaExtra"
     )
-    parser.add_argument("--source-qlib-dir", default="/root/.qlib/qlib_data/cn_extra_data_improve")
+    parser.add_argument("--source-qlib-dir", default="/root/.qlib/qlib_data/cn_extra_data_h5")
     parser.add_argument("--qlib-dir", required=True, help="Output filtered qlib data directory")
     parser.add_argument("--output", required=True, help="Output report directory")
     parser.add_argument("--market", default=os.environ.get("TARGET_MARKET", "all"))
     parser.add_argument("--missing-threshold", type=float, default=0.5,
                         help="Stocks with missing ratio > this are excluded (default: 0.5)")
     parser.add_argument("--pred-date", default=None)
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Number of parallel workers for stock check (0=auto, default: auto)")
     parser.add_argument("--features-source", default=None,
                         help="Path calendars/features symlinks point to (default: source-qlib-dir)")
     args = parser.parse_args()
@@ -261,6 +306,11 @@ def main() -> None:
     source_features = source_dir / "features"
     instruments_src = source_dir / "instruments"
 
+    # Auto-detect expected features from the first stock's bin files
+    global EXPECTED_FEATURES
+    if EXPECTED_FEATURES is None:
+        EXPECTED_FEATURES = _discover_expected_features(source_features)
+
     # Load instrument codes from the market definition
     all_df = _read_instruments_file(instruments_src / "all.txt")
     stock_codes = sorted(all_df["code"].tolist())
@@ -269,7 +319,7 @@ def main() -> None:
     print(f"Missing threshold: {args.missing_threshold}")
     print(f"Expected features per stock: {len(EXPECTED_FEATURES)}")
 
-    results = _check_all_stocks(source_features, stock_codes)
+    results = _check_all_stocks(source_features, stock_codes, workers=args.workers)
 
     # Summary statistics
     ratios = [r["missing_ratio"] for r in results.values()]

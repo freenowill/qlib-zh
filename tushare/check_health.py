@@ -1,413 +1,672 @@
+#!/usr/bin/env python3
 """
-check_health.py - 检查 extra_data 数据是否健康、可用
+check_health.py - CSI300 / CSI1000 股票数据完整性检查与自动补全
+
+功能:
+  1. 读取 cn_data/instruments 下的 csi300.txt 和 csi1000.txt，取并集唯一股票
+  2. 均分到 10 个 worker 进程
+  3. 每个 worker 串行检查每只股票:
+     - CSV 文件完整性 (9 个文件)
+     - 文件内每年数据完整性 (日频 >= 200 天, 财务 >= 3 条)
+  4. 缺失部分自动通过 TuShare API 拉取补全
 
 用法:
-  python3 check_health.py                  # 检查所有 extra_data/{SYMBOL}/ 目录
-  python3 check_health.py SZ000001         # 只检查指定股票
+  # 仅检查 (dry-run)
+  docker run --rm -v $(pwd)/tushare:/workspace -w /workspace \\
+    zhuhai123/local_qlib:v1-tushare \\
+    python3 check_health.py --check-only
 
-检查项:
-  1. 必需文件是否存在
-  2. CSV 列名是否完整
-  3. 数据行数是否合理
-  4. 日期覆盖范围与一致性
-  5. 数值列的缺失率与异常值
-  6. 跨文件日期对齐
-  7. 财报公告日 vs 报告期逻辑
+  # 检查并补全
+  docker run --rm -v $(pwd)/tushare:/workspace -w /workspace \\
+    zhuhai123/local_qlib:v1-tushare \\
+    python3 check_health.py
 """
 
 import argparse
+import json
+import logging
 import os
 import sys
-import logging
+import time
+import traceback
+from collections import defaultdict
+from datetime import datetime
+from multiprocessing import Process
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
-
-EXTRA_DATA_DIR = Path(__file__).parent / "extra_data"
+sys.path.insert(0, str(Path(__file__).parent))
+from api_utils import TushareAPI, symbol_to_ts_code
 
 # ============================================================
-# 期望的列定义
+# 配置
 # ============================================================
-REQUIRED_FILES = {
-    "daily.csv": {
-        "must_have": ["ts_code", "trade_date", "open", "high", "low", "close",
-                       "vol", "amount"],
-        "description": "日线行情",
-    },
-    "daily_basic.csv": {
-        "must_have": ["ts_code", "trade_date", "pe", "pe_ttm", "pb",
-                       "turnover_rate", "total_mv", "circ_mv"],
-        "description": "每日指标",
-    },
+SCRIPT_DIR = Path(__file__).parent
+EXTRA_DATA_DIR = SCRIPT_DIR / "extra_data"
+INSTRUMENTS_DIR = SCRIPT_DIR / "cn_data" / "instruments"
+LOG_DIR = EXTRA_DATA_DIR / ".logs"
+
+EXPECTED_CSV = [
+    "daily.csv", "daily_basic.csv", "adj_factor.csv",
+    "fina_indicator.csv", "income.csv", "balancesheet.csv", "cashflow.csv",
+    "dividend.csv", "stock_company.csv",
+]
+
+DAILY_FILES = {
+    "daily.csv":        ("daily",        "trade_date", "fetch_daily"),
+    "daily_basic.csv":  ("daily_basic",  "trade_date", "fetch_daily_basic"),
+    "adj_factor.csv":   ("adj_factor",   "trade_date", "fetch_adj_factor"),
 }
 
-OPTIONAL_FILES = {
-    "fina_indicator.csv": {
-        "must_have": ["ts_code", "ann_date", "end_date", "eps", "roe",
-                       "debt_to_assets"],
-        "description": "财务指标 (季报)",
-    },
-    "income.csv": {
-        "must_have": ["ts_code", "ann_date", "end_date", "total_revenue",
-                       "n_income"],
-        "description": "利润表",
-    },
-    "balancesheet.csv": {
-        "must_have": ["ts_code", "ann_date", "end_date", "total_assets",
-                       "total_liab"],
-        "description": "资产负债表",
-    },
-    "cashflow.csv": {
-        "must_have": ["ts_code", "ann_date", "end_date"],
-        "description": "现金流量表",
-    },
-    "dividend.csv": {
-        "must_have": ["ts_code", "end_date"],
-        "description": "分红送股",
-    },
+FINANCIAL_FILES = {
+    "fina_indicator.csv": ("fina_indicator", "ann_date", "fetch_fina_indicator"),
+    "income.csv":         ("income",         "ann_date", "fetch_income"),
+    "balancesheet.csv":   ("balancesheet",   "ann_date", "fetch_balancesheet"),
+    "cashflow.csv":       ("cashflow",       "ann_date", "fetch_cashflow"),
 }
 
-# 数值列的合理范围 (min, max)，用于异常值检测
-VALUE_RANGES = {
-    "pe":           (-1000, 10000),
-    "pe_ttm":       (-1000, 10000),
-    "pb":           (-100, 1000),
-    "turnover_rate": (0, 100),
-    "roe":          (-100, 200),
-    "eps":          (-50, 100),
-    "debt_to_assets": (0, 200),
+STATIC_FILES = {
+    "dividend.csv":      "fetch_dividend",
+    "stock_company.csv": "fetch_stock_company",
 }
+
+YEAR_THRESHOLD = 200
+
+
+# ============================================================
+# 股票列表
+# ============================================================
+def load_index_symbols(*index_names: str) -> list[str]:
+    """从 cn_data/instruments/<name>.txt 加载指数成分股 (取并集去重)"""
+    symbols = set()
+    for name in index_names:
+        idx_file = INSTRUMENTS_DIR / f"{name}.txt"
+        if not idx_file.exists():
+            logging.warning("指数文件不存在: %s", idx_file)
+            continue
+        with open(idx_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                code = line.split("\t")[0].strip().upper()
+                if code:
+                    symbols.add(code)
+    return sorted(symbols)
 
 
 # ============================================================
 # 检查函数
 # ============================================================
-class HealthReport:
-    """汇总检查结果"""
+def get_listing_date(stock_dir: Path) -> str:
+    """获取上市日期: stock_company.csv > daily.csv > 默认"""
+    sc = stock_dir / "stock_company.csv"
+    if sc.exists():
+        try:
+            df = pd.read_csv(sc)
+            if "list_date" in df.columns and not df.empty:
+                ld = str(df["list_date"].dropna().iloc[0])
+                if ld and ld != "nan":
+                    return ld.replace("-", "")[:8]
+        except Exception:
+            pass
 
-    def __init__(self, symbol):
-        self.symbol = symbol
-        self.errors = []
-        self.warnings = []
-        self.info = []
+    daily = stock_dir / "daily.csv"
+    if daily.exists():
+        try:
+            df = pd.read_csv(daily, usecols=["trade_date"])
+            if not df.empty:
+                dates = sorted(df["trade_date"].dropna().astype(str))
+                return dates[0]
+        except Exception:
+            pass
 
-    def error(self, msg):
-        self.errors.append(msg)
-        logger.error(f"  [ERROR] {msg}")
-
-    def warn(self, msg):
-        self.warnings.append(msg)
-        logger.warning(f"  [WARN]  {msg}")
-
-    def ok(self, msg):
-        self.info.append(msg)
-        logger.info(f"  [OK]    {msg}")
-
-    @property
-    def healthy(self):
-        return len(self.errors) == 0
-
-    def summary(self):
-        lines = [
-            "",
-            "=" * 60,
-            f"健康检查报告: {self.symbol}",
-            "=" * 60,
-            f"  错误: {len(self.errors)}",
-            f"  警告: {len(self.warnings)}",
-            f"  状态: {'健康' if self.healthy else '异常'}",
-        ]
-        if self.errors:
-            lines.append("")
-            lines.append("错误详情:")
-            for e in self.errors:
-                lines.append(f"  - {e}")
-        if self.warnings:
-            lines.append("")
-            lines.append("警告详情:")
-            for w in self.warnings:
-                lines.append(f"  - {w}")
-        lines.append("=" * 60)
-        return "\n".join(lines)
+    return "20000101"
 
 
-def check_files_exist(data_dir, report):
-    """检查文件是否存在"""
-    logger.info(f"检查文件存在性: {data_dir.name}")
-    found = {}
-    for fname, meta in REQUIRED_FILES.items():
-        path = data_dir / fname
-        if path.exists():
-            found[fname] = pd.read_csv(path, dtype=str)
-            report.ok(f"{fname} 存在 ({meta['description']})")
-        else:
-            report.error(f"必需文件缺失: {fname} ({meta['description']})")
-
-    for fname, meta in OPTIONAL_FILES.items():
-        path = data_dir / fname
-        if path.exists():
-            found[fname] = pd.read_csv(path, dtype=str)
-            report.ok(f"{fname} 存在 ({meta['description']})")
-        else:
-            report.warn(f"可选文件缺失: {fname} ({meta['description']})")
-
-    return found
+def check_csv_existence(stock_dir: Path) -> list[str]:
+    """返回缺失的 CSV 文件名列表"""
+    missing = []
+    for fname in EXPECTED_CSV:
+        fp = stock_dir / fname
+        if not fp.exists() or fp.stat().st_size == 0:
+            missing.append(fname)
+    return missing
 
 
-def check_columns(dfs, report):
-    """检查 CSV 列名完整性"""
-    logger.info("检查列名完整性")
-    all_specs = {**REQUIRED_FILES, **OPTIONAL_FILES}
-    for fname, df in dfs.items():
-        if fname not in all_specs:
-            continue
-        spec = all_specs[fname]
-        missing = [c for c in spec["must_have"] if c not in df.columns]
-        if missing:
-            report.error(f"{fname} 缺少必需列: {missing}")
-        else:
-            report.ok(f"{fname} 列名完整 ({len(df.columns)} 列)")
+def check_year_completeness(csv_path: Path, date_col: str,
+                             list_year: int, current_year: int,
+                             threshold: int = YEAR_THRESHOLD,
+                             max_stale_days: int = 1) -> list[int]:
+    """返回日频数据缺失的年份
+
+    对于当前年份，不仅检查条数，还检查最新日期是否在 max_stale_days 天内。
+    默认 1 天，要求最新数据为昨天或今天。
+    """
+    if not csv_path.exists():
+        return list(range(list_year, current_year + 1))
+
+    try:
+        df = pd.read_csv(csv_path, usecols=[date_col])
+        if df.empty:
+            return list(range(list_year, current_year + 1))
+
+        dates = df[date_col].dropna().astype(str)
+        year_counts = defaultdict(int)
+        latest = ""
+        for d in dates:
+            year_counts[int(d[:4])] += 1
+            if d > latest:
+                latest = d
+
+        missing = []
+        for y in range(list_year, current_year + 1):
+            cnt = year_counts.get(y, 0)
+            if y == list_year:
+                need = min(threshold, 150)
+            elif y == current_year:
+                # 检查新鲜度: 最新日期距今是否超过 max_stale_days
+                if latest:
+                    latest_dt = datetime.strptime(latest[:8], "%Y%m%d")
+                    stale_days = (datetime.now() - latest_dt).days
+                    need = 0 if stale_days <= max_stale_days else threshold + 1  # 强制标记缺失
+                else:
+                    need = 1
+            else:
+                need = threshold
+            if cnt < need:
+                missing.append(y)
+        return missing
+    except Exception:
+        return list(range(list_year, current_year + 1))
 
 
-def check_row_counts(dfs, report):
-    """检查行数是否合理"""
-    logger.info("检查数据行数")
-    for fname, df in dfs.items():
-        n = len(df)
-        if n == 0:
-            report.error(f"{fname} 为空 (0 行)")
-        elif n < 10:
-            report.warn(f"{fname} 仅 {n} 行，数据可能不完整")
-        else:
-            report.ok(f"{fname} 有 {n} 行数据")
+def check_financial_completeness(csv_path: Path, date_col: str,
+                                  list_year: int, current_year: int,
+                                  max_stale_days: int = 120) -> list[int]:
+    """返回财务数据缺失的年份
 
+    当前年份除条数检查外，还验证最新公告日期是否在 max_stale_days 天内。
+    财报季频公布，容忍 120 天。
+    """
+    start_year = max(list_year, 2010)
+    if not csv_path.exists():
+        return list(range(start_year, current_year + 1))
 
-def check_date_coverage(dfs, report):
-    """检查日期覆盖范围"""
-    logger.info("检查日期覆盖范围")
-    date_ranges = {}
+    try:
+        df = pd.read_csv(csv_path, usecols=[date_col])
+        if df.empty:
+            return list(range(start_year, current_year + 1))
 
-    if "daily.csv" in dfs:
-        df = dfs["daily.csv"]
-        dates = sorted(df["trade_date"].unique())
-        date_ranges["daily"] = (dates[0], dates[-1], len(dates))
-        report.ok(f"daily 日期: {dates[0]} ~ {dates[-1]} ({len(dates)} 交易日)")
+        dates = df[date_col].dropna().astype(str)
+        year_counts = defaultdict(int)
+        latest = ""
+        for d in dates:
+            year_counts[int(d[:4])] += 1
+            if d > latest:
+                latest = d
 
-    if "daily_basic.csv" in dfs:
-        df = dfs["daily_basic.csv"]
-        dates = sorted(df["trade_date"].unique())
-        date_ranges["daily_basic"] = (dates[0], dates[-1], len(dates))
-        report.ok(f"daily_basic 日期: {dates[0]} ~ {dates[-1]} ({len(dates)} 交易日)")
-
-    # 检查 daily 和 daily_basic 日期一致性
-    if "daily" in date_ranges and "daily_basic" in date_ranges:
-        d1 = set(dfs["daily.csv"]["trade_date"].unique())
-        d2 = set(dfs["daily_basic.csv"]["trade_date"].unique())
-        missing_in_basic = d1 - d2
-        missing_in_daily = d2 - d1
-        if missing_in_daily:
-            report.warn(f"daily_basic 有 {len(missing_in_daily)} 个交易日不在 daily 中")
-        if missing_in_basic:
-            report.warn(f"daily 有 {len(missing_in_basic)} 个交易日不在 daily_basic 中")
-        if not missing_in_daily and not missing_in_basic:
-            report.ok("daily 与 daily_basic 日期完全对齐")
-
-    return date_ranges
-
-
-def check_numeric_values(dfs, report):
-    """检查数值列的缺失率和异常值"""
-    logger.info("检查数值质量")
-
-    for fname, df in dfs.items():
-        # 找出应该是数值的列
-        non_numeric = {"ts_code", "trade_date", "ann_date", "f_ann_date",
-                       "end_date", "report_type", "comp_type", "end_type",
-                       "div_proc", "record_date", "ex_date", "pay_date",
-                       "div_listdate", "imp_ann_date", "setup_date",
-                       "province", "city", "website", "email", "office",
-                       "introduction", "main_business", "business_scope",
-                       "chairman", "manager", "secretary", "exchange"}
-        num_cols = [c for c in df.columns if c not in non_numeric]
-
-        for col in num_cols:
-            series = pd.to_numeric(df[col], errors="coerce")
-            total = len(series)
-            nan_count = series.isna().sum()
-            nan_ratio = nan_count / total if total > 0 else 0
-
-            if nan_ratio > 0.9:
-                report.warn(f"{fname}/{col}: 缺失率 {nan_ratio:.1%} ({nan_count}/{total})")
-            elif nan_ratio > 0.5:
-                report.warn(f"{fname}/{col}: 缺失率较高 {nan_ratio:.1%}")
-
-            # 异常值检查
-            if fname in VALUE_RANGES or col in VALUE_RANGES:
-                key = col if col in VALUE_RANGES else None
-                if key and key in VALUE_RANGES:
-                    lo, hi = VALUE_RANGES[key]
-                    valid = series.dropna()
-                    outliers = valid[(valid < lo) | (valid > hi)]
-                    if len(outliers) > 0:
-                        report.warn(
-                            f"{fname}/{col}: {len(outliers)} 个值超出 [{lo}, {hi}] 范围"
-                        )
-
-
-def check_fundamental_dates(dfs, report):
-    """检查财报公告日 vs 报告期逻辑"""
-    logger.info("检查财报日期逻辑")
-    for fname in ["fina_indicator.csv", "income.csv", "balancesheet.csv",
-                   "cashflow.csv"]:
-        if fname not in dfs:
-            continue
-        df = dfs[fname]
-        if "ann_date" not in df.columns or "end_date" not in df.columns:
-            continue
-
-        ann = pd.to_numeric(df["ann_date"], errors="coerce")
-        end = pd.to_numeric(df["end_date"], errors="coerce")
-
-        # 公告日应 >= 报告期
-        bad = df[(ann.notna()) & (end.notna()) & (ann < end)]
-        if len(bad) > 0:
-            report.warn(
-                f"{fname}: {len(bad)} 条记录的 ann_date < end_date (可能有修正公告)"
-            )
-
-        # 检查是否有重复的 (ann_date, end_date) 组合
-        if "report_type" in df.columns:
-            dup_cols = ["ann_date", "end_date", "report_type"]
-        else:
-            dup_cols = ["ann_date", "end_date"]
-        available = [c for c in dup_cols if c in df.columns]
-        if available:
-            dups = df.duplicated(subset=available, keep=False)
-            if dups.sum() > 0:
-                report.warn(f"{fname}: {dups.sum()} 条重复记录 (按 {available})")
-
-        report.ok(f"{fname}: 日期逻辑检查通过 ({len(df)} 条)")
-
-
-def check_ts_code_consistency(dfs, report):
-    """检查 ts_code 是否一致"""
-    logger.info("检查 ts_code 一致性")
-    codes = set()
-    for fname, df in dfs.items():
-        if "ts_code" in df.columns:
-            file_codes = set(df["ts_code"].unique())
-            codes |= file_codes
-            if len(file_codes) > 1:
-                report.warn(f"{fname} 包含多个 ts_code: {file_codes}")
-
-    if len(codes) > 1:
-        report.warn(f"数据中包含多个股票: {codes}")
-    elif len(codes) == 1:
-        report.ok(f"ts_code 一致: {codes.pop()}")
-
-
-def check_dividend(dfs, report):
-    """检查分红数据"""
-    if "dividend.csv" not in dfs:
-        return
-    logger.info("检查分红数据")
-    df = dfs["dividend.csv"]
-    if "cash_div" in df.columns:
-        cash_div = pd.to_numeric(df["cash_div"], errors="coerce")
-        has_div = (cash_div > 0).sum()
-        report.ok(f"分红记录 {len(df)} 条, 其中现金分红 {has_div} 条")
+        missing = []
+        for y in range(start_year, current_year + 1):
+            need = 1 if y == current_year else 3
+            cnt = year_counts.get(y, 0)
+            if cnt < need:
+                missing.append(y)
+            elif y == current_year and latest:
+                # 即使当年有条数，也检查是否太旧
+                latest_dt = datetime.strptime(latest[:8], "%Y%m%d")
+                if (datetime.now() - latest_dt).days > max_stale_days:
+                    missing.append(y)
+        return missing
+    except Exception:
+        return list(range(start_year, current_year + 1))
 
 
 # ============================================================
-# 主流程
+# 拉取函数
 # ============================================================
-def check_one_stock(data_dir):
-    """检查单只股票的 extra_data"""
-    symbol = data_dir.name
-    report = HealthReport(symbol)
-
-    logger.info(f"{'=' * 60}")
-    logger.info(f"检查: {symbol} ({data_dir})")
-    logger.info(f"{'=' * 60}")
-
-    # 1. 文件存在性
-    dfs = check_files_exist(data_dir, report)
-    if not dfs:
-        report.error("没有找到任何 CSV 文件")
-        return report
-
-    # 2. 列名完整性
-    check_columns(dfs, report)
-
-    # 3. 行数
-    check_row_counts(dfs, report)
-
-    # 4. 日期覆盖
-    check_date_coverage(dfs, report)
-
-    # 5. 数值质量
-    check_numeric_values(dfs, report)
-
-    # 6. 财报日期逻辑
-    check_fundamental_dates(dfs, report)
-
-    # 7. ts_code 一致性
-    check_ts_code_consistency(dfs, report)
-
-    # 8. 分红数据
-    check_dividend(dfs, report)
-
-    return report
+def _read_csv_safe(csv_path: Path) -> pd.DataFrame:
+    """安全读取 CSV，失败返回空 DataFrame"""
+    try:
+        return pd.read_csv(csv_path)
+    except Exception:
+        return pd.DataFrame()
 
 
+def _normalize_date_col(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
+    """统一日期列为 int64 类型，避免 str/int 混合导致 sort_values 失败"""
+    if df.empty or date_col not in df.columns:
+        return df
+    df = df.copy()
+    df[date_col] = pd.to_numeric(df[date_col], errors="coerce").astype("Int64")
+    df = df.dropna(subset=[date_col])
+    return df
+
+
+def _write_csv_safe(df: pd.DataFrame, csv_path: Path):
+    """安全写入 CSV，日期列转为纯字符串避免类型漂移"""
+    df.to_csv(csv_path, index=False)
+
+
+def pull_missing_file(api: TushareAPI, ts_code: str, stock_dir: Path,
+                       fname: str, log: logging.Logger) -> bool:
+    """拉取缺失的单个 CSV 文件"""
+    try:
+        today = datetime.now().strftime("%Y%m%d")
+
+        if fname in DAILY_FILES:
+            _, date_col, method_name = DAILY_FILES[fname]
+            if method_name == "fetch_adj_factor":
+                df = api.fetch_adj_factor(ts_code, "20000101", today, cache_dir=stock_dir)
+            else:
+                df = getattr(api, method_name)(ts_code=ts_code, start_date="20000101", end_date=today)
+            if df is not None and not df.empty:
+                df = _normalize_date_col(df, date_col)
+                _write_csv_safe(df, stock_dir / fname)
+                return True
+
+        elif fname in FINANCIAL_FILES:
+            _, date_col, method_name = FINANCIAL_FILES[fname]
+            df = getattr(api, method_name)(ts_code=ts_code, start_date="20100101", end_date=today)
+            if df is not None and not df.empty:
+                df = _normalize_date_col(df, date_col)
+                _write_csv_safe(df, stock_dir / fname)
+                return True
+
+        elif fname in STATIC_FILES:
+            df = getattr(api, STATIC_FILES[fname])(ts_code=ts_code)
+            if df is not None and not df.empty:
+                _write_csv_safe(df, stock_dir / fname)
+                return True
+
+        return False
+    except Exception as e:
+        log.warning("  拉取 %s 失败: %s", fname, e)
+        return False
+
+
+def _years_to_ranges(years: list[int]) -> list[tuple[int, int]]:
+    """将年份列表合并为连续区间. [2004,2005,2006,2008,2009] -> [(2004,2006), (2008,2009)]"""
+    if not years:
+        return []
+    yrs = sorted(years)
+    ranges = []
+    start = end = yrs[0]
+    for y in yrs[1:]:
+        if y == end + 1:
+            end = y
+        else:
+            ranges.append((start, end))
+            start = end = y
+    ranges.append((start, end))
+    return ranges
+
+
+def pull_missing_daily_years(api: TushareAPI, ts_code: str, stock_dir: Path,
+                              fname: str, missing_years: list[int],
+                              log: logging.Logger) -> int:
+    """合并连续年份为区间，批量补全日频数据。返回补全的年份数。"""
+    _, date_col, method = DAILY_FILES[fname]
+    fetch_fn = getattr(api, method)
+    csv_path = stock_dir / fname
+
+    existing = _read_csv_safe(csv_path)
+    existing = _normalize_date_col(existing, date_col)
+
+    ranges = _years_to_ranges(missing_years)
+    fixed = 0
+    for yr_start, yr_end in ranges:
+        sd, ed = f"{yr_start}0101", f"{yr_end}1231"
+        try:
+            if method == "fetch_adj_factor":
+                df = api.fetch_adj_factor(ts_code, sd, ed, cache_dir=stock_dir)
+            else:
+                df = fetch_fn(ts_code=ts_code, start_date=sd, end_date=ed)
+            if df is not None and not df.empty:
+                df = _normalize_date_col(df, date_col)
+                existing = pd.concat([existing, df], ignore_index=True)
+                fixed += (yr_end - yr_start + 1)
+            else:
+                log.debug("  %s %s-%s 返回空", fname, yr_start, yr_end)
+        except Exception as e:
+            log.warning("  %s %s-%s 失败: %s", fname, yr_start, yr_end, e)
+
+    if fixed > 0:
+        existing = existing.drop_duplicates(subset=[date_col]).sort_values(date_col)
+        _write_csv_safe(existing, csv_path)
+    return fixed
+
+
+def pull_missing_financial_years(api: TushareAPI, ts_code: str, stock_dir: Path,
+                                  fname: str, missing_years: list[int],
+                                  log: logging.Logger) -> int:
+    """合并连续年份为区间，批量补全财务数据。返回补全的年份数。"""
+    _, date_col, method = FINANCIAL_FILES[fname]
+    fetch_fn = getattr(api, method)
+    csv_path = stock_dir / fname
+
+    existing = _read_csv_safe(csv_path)
+    existing = _normalize_date_col(existing, date_col)
+
+    ranges = _years_to_ranges(missing_years)
+    fixed = 0
+    for yr_start, yr_end in ranges:
+        try:
+            df = fetch_fn(ts_code=ts_code, start_date=f"{yr_start}0101", end_date=f"{yr_end}1231")
+            if df is not None and not df.empty:
+                df = _normalize_date_col(df, date_col)
+                existing = pd.concat([existing, df], ignore_index=True)
+                fixed += (yr_end - yr_start + 1)
+        except Exception as e:
+            log.warning("  %s %s-%s 失败: %s", fname, yr_start, yr_end, e)
+
+    if fixed > 0:
+        existing = existing.drop_duplicates(subset=[date_col]).sort_values(date_col)
+        _write_csv_safe(existing, csv_path)
+    return fixed
+
+
+# ============================================================
+# Worker
+# ============================================================
+def worker(worker_id: int, symbols: list[str], check_only: bool,
+            year_threshold: int):
+    """每个 worker 串行处理分配到的股票，结果写入日志文件"""
+    log = _setup_worker_logger(worker_id)
+    api = None if check_only else TushareAPI()
+
+    current_year = datetime.now().year
+    total = len(symbols)
+
+    stats = {"checked": 0, "ok": 0, "csv_missing": 0, "csv_fixed": 0,
+             "years_missing": 0, "years_fixed": 0, "errors": 0,
+             "api_calls": 0, "planned_calls": 0}
+    details = []
+
+    log.info("开始: %d 只股票", total)
+
+    for i, symbol in enumerate(symbols):
+        stock_dir = EXTRA_DATA_DIR / symbol
+        ts_code = symbol_to_ts_code(symbol)
+        stock_dir.mkdir(parents=True, exist_ok=True)
+
+        stock_issues = {"symbol": symbol, "missing_files": [], "missing_years": {}}
+
+        try:
+            # 1. CSV 文件完整性
+            missing_csv = check_csv_existence(stock_dir)
+            if missing_csv:
+                stats["csv_missing"] += len(missing_csv)
+                stock_issues["missing_files"] = missing_csv
+                log.info("[%d/%d] %s 缺文件: %s", i + 1, total, symbol, missing_csv)
+
+                if not check_only:
+                    for fname in missing_csv:
+                        if pull_missing_file(api, ts_code, stock_dir, fname, log):
+                            stats["csv_fixed"] += 1
+                            stats["api_calls"] += 1
+                        else:
+                            stats["errors"] += 1
+                else:
+                    stats["planned_calls"] += len(missing_csv)
+
+            # 2. 年份完整性
+            list_date = get_listing_date(stock_dir)
+            list_year = int(list_date[:4])
+
+            # 日频
+            for fname, (_, date_col, _) in DAILY_FILES.items():
+                if not (stock_dir / fname).exists():
+                    continue
+                missing_yrs = check_year_completeness(
+                    stock_dir / fname, date_col, list_year, current_year, year_threshold)
+                if missing_yrs:
+                    nranges = len(_years_to_ranges(missing_yrs))
+                    stock_issues["missing_years"][fname] = missing_yrs
+                    stats["years_missing"] += len(missing_yrs)
+                    stats["planned_calls"] += nranges
+
+                    if not check_only:
+                        n = pull_missing_daily_years(
+                            api, ts_code, stock_dir, fname, missing_yrs, log)
+                        stats["years_fixed"] += n
+                        stats["api_calls"] += n
+
+            # 财务
+            for fname, (_, date_col, _) in FINANCIAL_FILES.items():
+                if not (stock_dir / fname).exists():
+                    continue
+                missing_yrs = check_financial_completeness(
+                    stock_dir / fname, date_col, list_year, current_year)
+                if missing_yrs:
+                    nranges = len(_years_to_ranges(missing_yrs))
+                    stock_issues["missing_years"][fname] = missing_yrs
+                    stats["years_missing"] += len(missing_yrs)
+                    stats["planned_calls"] += nranges
+
+                    if not check_only:
+                        n = pull_missing_financial_years(
+                            api, ts_code, stock_dir, fname, missing_yrs, log)
+                        stats["years_fixed"] += n
+                        stats["api_calls"] += n
+
+            if not stock_issues["missing_files"] and not stock_issues["missing_years"]:
+                stats["ok"] += 1
+            else:
+                details.append(stock_issues)
+
+            stats["checked"] += 1
+
+        except Exception as e:
+            stats["errors"] += 1
+            log.error("[%d/%d] %s 异常: %s", i + 1, total, symbol, e)
+            traceback.print_exc(file=sys.stderr)
+
+        # 进度 (每 50 只)
+        if (i + 1) % 50 == 0:
+            log.info("--- %d/%d (ok=%d, fix_csv=%d, fix_yr=%d, err=%d) ---",
+                     i + 1, total, stats["ok"], stats["csv_fixed"],
+                     stats["years_fixed"], stats["errors"])
+
+    # 写结果文件
+    result_file = LOG_DIR / f"check_health_w{worker_id:02d}_result.json"
+    with open(result_file, "w") as f:
+        json.dump({"worker_id": worker_id, "stats": stats, "details": details},
+                  f, ensure_ascii=False, indent=2, default=str)
+
+    log.info("完成: check=%d ok=%d csv_miss=%d csv_fix=%d yr_miss=%d yr_fix=%d api=%d err=%d",
+             stats["checked"], stats["ok"], stats["csv_missing"], stats["csv_fixed"],
+             stats["years_missing"], stats["years_fixed"], stats["api_calls"], stats["errors"])
+
+
+def _setup_worker_logger(worker_id: int) -> logging.Logger:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log = logging.getLogger(f"w{worker_id:02d}")
+    log.setLevel(logging.INFO)
+    log.handlers.clear()
+
+    fh = logging.FileHandler(LOG_DIR / f"check_health_w{worker_id:02d}.log")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S"))
+    log.addHandler(fh)
+
+    # 控制台: 输出 INFO+ 让用户看到实时进度
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter(f"[W{worker_id:02d}] %(message)s"))
+    log.addHandler(ch)
+
+    # 让 api_utils 的限流日志也写入 worker 文件
+    au_log = logging.getLogger("api_utils")
+    au_log.setLevel(logging.INFO)
+    au_log.handlers.clear()
+    au_log.addHandler(fh)
+    au_log.propagate = False
+
+    return log
+
+
+# ============================================================
+# Main
+# ============================================================
 def main():
-    parser = argparse.ArgumentParser(description="检查 extra_data 数据健康状态")
-    parser.add_argument("symbols", nargs="*",
-                        help="股票代码列表，如 SZ000001 SZ000002 (留空则检查所有)")
+    parser = argparse.ArgumentParser(description="CSI300/CSI1000 数据完整性检查与补全")
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--check-only", action="store_true", help="仅检查 (dry-run)")
+    parser.add_argument("--year-threshold", type=int, default=YEAR_THRESHOLD,
+                        help=f"日频数据最低天数/年 (默认 {YEAR_THRESHOLD})")
+    parser.add_argument("--index", nargs="+", default=["csi300", "csi1000"],
+                        help="指数名称 (默认 csi300 csi1000)")
     args = parser.parse_args()
 
-    if args.symbols:
-        symbols = [s.upper() for s in args.symbols]
-    else:
-        if not EXTRA_DATA_DIR.exists():
-            logger.error(f"extra_data 目录不存在: {EXTRA_DATA_DIR}")
-            sys.exit(1)
-        symbols = sorted([d.name for d in EXTRA_DATA_DIR.iterdir() if d.is_dir()])
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    if not symbols:
-        logger.error("没有找到任何股票数据目录")
-        sys.exit(1)
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s",
+                        datefmt="%H:%M:%S")
+    main_log = logging.getLogger("main")
 
-    reports = []
-    for symbol in symbols:
-        data_dir = EXTRA_DATA_DIR / symbol
-        if not data_dir.exists():
-            logger.error(f"目录不存在: {data_dir}")
-            reports.append(HealthReport(symbol))
-            reports[-1].error(f"目录不存在: {data_dir}")
-            continue
-        reports.append(check_one_stock(data_dir))
+    # 加载股票列表
+    symbols = load_index_symbols(*args.index)
+    total = len(symbols)
+    n_workers = min(args.workers, total) if total > 0 else 1
 
-    # 汇总
-    print("\n" + "=" * 60)
-    print("汇总")
-    print("=" * 60)
-    for r in reports:
-        status = "健康" if r.healthy else "异常"
-        print(f"  {r.symbol:12s}  {status}  (错误:{len(r.errors)} 警告:{len(r.warnings)})")
-    print("=" * 60)
+    # 清空旧 worker 日志，避免进度监控读到上次运行的数据
+    for w_id in range(n_workers):
+        (LOG_DIR / f"check_health_w{w_id:02d}.log").write_text("")
+        (LOG_DIR / f"check_health_w{w_id:02d}_result.json").unlink(missing_ok=True)
+
+    main_log.info("=" * 60)
+    main_log.info("check_health: %s 成分股", ", ".join(args.index))
+    main_log.info("股票: %d 只, Workers: %d, 模式: %s, 阈值: %d 天/年",
+                  total, n_workers,
+                  "仅检查" if args.check_only else "检查+补全",
+                  args.year_threshold)
+    main_log.info("=" * 60)
+
+    # 均分股票
+    chunk_size = (total + n_workers - 1) // n_workers
+    processes = []
+    for w_id in range(n_workers):
+        start = w_id * chunk_size
+        end = min(start + chunk_size, total)
+        if start >= total:
+            break
+        chunk = symbols[start:end]
+        p = Process(target=worker, args=(w_id, chunk, args.check_only, args.year_threshold))
+        p.start()
+        processes.append(p)
+
+    main_log.info("已启动 %d 个 worker, 分配: %s",
+                  len(processes),
+                  [len(symbols[i * chunk_size:min((i + 1) * chunk_size, total)])
+                   for i in range(len(processes))])
+
+    # 进度监控线程: 每 30s 汇总各 worker 进度到控制台
+    import threading
+    stop_monitor = threading.Event()
+    monitor_start = time.time()
+
+    def monitor_progress():
+        first_run = True
+        while not stop_monitor.is_set():
+            stop_monitor.wait(10 if first_run else 30)
+            first_run = False
+            if stop_monitor.is_set():
+                break
+            parts = []
+            for w_id in range(len(processes)):
+                log_file = LOG_DIR / f"check_health_w{w_id:02d}.log"
+                if not log_file.exists():
+                    continue
+                try:
+                    if log_file.stat().st_mtime < monitor_start:
+                        continue
+                    with open(log_file) as lf:
+                        lines = lf.readlines()
+
+                    # 找最后一条进度行
+                    prog_line = ""
+                    for line in reversed(lines):
+                        if "---" in line and "/" in line:
+                            prog_line = line.strip().split("---", 1)[-1].strip()
+                            break
+
+                    # 检查最近是否在限流等待 (日志末尾有 "限流等待")
+                    rate_limited = any("限流等待" in l for l in lines[-5:])
+
+                    if prog_line:
+                        tag = "[限流中]" if rate_limited else ""
+                        parts.append(f"W{w_id}:{prog_line} {tag}")
+                except Exception:
+                    pass
+            if parts:
+                main_log.info("进度 | %s", " | ".join(parts))
+
+    monitor = threading.Thread(target=monitor_progress, daemon=True)
+    monitor.start()
+
+    for p in processes:
+        p.join()
+    stop_monitor.set()
+
+    # 汇总所有 worker 结果
+    total_stats = {"checked": 0, "ok": 0, "csv_missing": 0, "csv_fixed": 0,
+                   "years_missing": 0, "years_fixed": 0, "errors": 0,
+                   "api_calls": 0, "planned_calls": 0}
+    all_details = []
+
+    for w_id in range(len(processes)):
+        rf = LOG_DIR / f"check_health_w{w_id:02d}_result.json"
+        if rf.exists():
+            with open(rf) as f:
+                r = json.load(f)
+            for k in total_stats:
+                total_stats[k] += r["stats"].get(k, 0)
+            all_details.extend(r.get("details", []))
+
+    # 报告
+    main_log.info("=" * 60)
+    main_log.info("汇总")
+    main_log.info("  检查: %d  正常: %d  错误: %d",
+                  total_stats["checked"], total_stats["ok"], total_stats["errors"])
+    main_log.info("  缺 CSV 文件: %d  已补全: %d",
+                  total_stats["csv_missing"], total_stats["csv_fixed"])
+    main_log.info("  缺年份:      %d  已补全: %d",
+                  total_stats["years_missing"], total_stats["years_fixed"])
+
+    total_calls = total_stats["api_calls"] if total_stats["api_calls"] > 0 else total_stats["planned_calls"]
+    if total_calls > 0:
+        main_log.info("  API 调用:    %d 次 (合并连续年份后)", total_calls)
+        main_log.info("  预估耗时:    %.1f 小时 (按 2800 次/小时)", total_calls / 2800)
+    main_log.info("=" * 60)
+
+    # 有问题股票摘要
+    if all_details:
+        main_log.info("问题股票: %d 只", len(all_details))
+        for d in all_details[:20]:
+            parts = [d["symbol"]]
+            if d["missing_files"]:
+                parts.append(f"缺文件({len(d['missing_files'])}):{','.join(d['missing_files'])}")
+            if d["missing_years"]:
+                yr_sum = " ".join(f"{k}:{len(v)}y" for k, v in d["missing_years"].items())
+                parts.append(yr_sum)
+            main_log.info("  %s", " | ".join(parts))
+        if len(all_details) > 20:
+            main_log.info("  ... 等 %d 只", len(all_details) - 20)
 
     # 详细报告
-    for r in reports:
-        print(r.summary())
+    report_path = LOG_DIR / "check_health_report.json"
+    with open(report_path, "w") as f:
+        json.dump({"time": datetime.now().isoformat(), "index": args.index,
+                    "stats": total_stats, "problem_count": len(all_details),
+                    "problems": all_details[:100]},
+                  f, ensure_ascii=False, indent=2, default=str)
+    main_log.info("报告: %s", report_path)
 
-    # 退出码: 有任何错误则返回 1
-    any_error = any(not r.healthy for r in reports)
-    sys.exit(1 if any_error else 0)
+    if total_stats["errors"] > 0:
+        main_log.warning("有 %d 个错误, 查看 worker 日志", total_stats["errors"])
 
 
 if __name__ == "__main__":

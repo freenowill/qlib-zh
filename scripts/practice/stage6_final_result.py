@@ -66,7 +66,9 @@ def _attach_latest_rank(df: pd.DataFrame, scores_df: pd.DataFrame) -> pd.DataFra
     merged["最新排名_pct"] = merged["latest_rank_pct"]
     if "stock" not in merged.columns:
         merged["stock"] = merged["code"]
-    merged["current_holding"] = True
+    # current_holding is set by caller based on actual previous week holdings
+    if "current_holding" not in merged.columns:
+        merged["current_holding"] = False
     if "score" not in merged.columns:
         merged["score"] = merged["latest_score"]
     merged = merged.drop(columns=[c for c in ["latest_rank_idx", "latest_rank_pct", "latest_score"] if c in merged.columns])
@@ -105,9 +107,12 @@ def import_env(key, default):
 
 def final_result(second_screen_csv: str, pred_dir: str,
                  output_dir: str, hold_num: int = 5,
-                 bottom_pct: float = 0.50):
+                 bottom_pct: float = 0.50,
+                 previous_holdings: set | None = None):
     if not (0 < bottom_pct < 1):
         raise ValueError("bottom_pct must be in (0, 1)")
+    if previous_holdings is None:
+        previous_holdings = set()
 
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -204,6 +209,10 @@ def final_result(second_screen_csv: str, pred_dir: str,
     candidate_df = _apply_portfolio_weights(candidate_df)
     result["是否需要替换"] = False
 
+    # Only mark stocks actually held from previous week as current_holding
+    previous_holdings_set = set(str(c).zfill(6) for c in (previous_holdings or set()))
+    result["current_holding"] = result["code"].astype(str).str.zfill(6).isin(previous_holdings_set)
+
     # ── 4. 保存 result.csv ────────────────────────
     result_csv = out_path / "result.csv"
     result.to_csv(result_csv, index=False, encoding="utf-8-sig")
@@ -217,19 +226,26 @@ def final_result(second_screen_csv: str, pred_dir: str,
     print(result[disp_cols].to_string(index=False))
     print(f"\n✓ result.csv 保存: {result_csv}")
 
-    # ── 5. 判断是否需要替换（最新排名在后50%）────────
+    # ── 5. 判断是否需要替换（仅对前周实际持仓中排名在后50%的）────────
     threshold_rank = int(total_stocks * (1 - bottom_pct))
     print(f"\n─── 调仓检查（后{int(bottom_pct*100)}% 阈值 = rank > {threshold_rank} / {total_stocks}）───")
+    if previous_holdings_set:
+        print(f"  前周持仓: {sorted(previous_holdings_set)}")
 
-    to_replace_codes = result[result["最新排名"] > threshold_rank]["code"].tolist()
+    # Only replace stocks that are ACTUAL previous holdings AND in the bottom 50%
+    holding_mask = result["current_holding"]
+    to_replace_codes = result[holding_mask & (result["最新排名"] > threshold_rank)]["code"].tolist()
     result.loc[result["code"].isin(to_replace_codes), "是否需要替换"] = True
 
     if not to_replace_codes:
-        print("  ✓ 无需调仓，所有持仓股票最新排名均未进入后50%")
+        if previous_holdings_set:
+            print("  ✓ 无需调仓，所有前周持仓股票最新排名均未进入后50%")
+        else:
+            print("  ✓ 首周建仓，无需调仓")
         result_update = result.copy()
         result_update["调仓说明"] = "持仓不变"
     else:
-        print(f"  ⚠ 以下股票最新排名进入后50%，需替换: {to_replace_codes}")
+        print(f"  ⚠ 以下前周持仓股票最新排名进入后50%，需替换: {to_replace_codes}")
         already_hold = set(result["code"].tolist())
         candidates = candidate_df[~candidate_df["code"].isin(already_hold)].copy()
         candidates = candidates.sort_values(["最新排名", "score"], ascending=[True, False], na_position="last").reset_index(drop=True)

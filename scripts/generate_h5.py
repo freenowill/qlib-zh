@@ -1,29 +1,36 @@
-"""Generate daily_pv_all.h5 and daily_pv_debug.h5 from extra_data CSV files.
-
-Reads ALL 58 features directly from tushare/extra_data/{SYMBOL}/*.csv,
-bypassing qlib entirely. fin_factor uses these HDF5 files to understand
-available data columns for factor mining.
-
-Usage:
-    cd rdagent_workspace/factor_data_template && python generate.py
+#!/usr/bin/env python3
 """
+generate_h5.py — 按指数生成 HDF5 数据文件
+
+从 tushare/extra_data 中提取指定指数的成分股数据（58 个原始字段），
+生成 H5 文件，供 fin_factor 和 build_features_from_h5.py 使用。
+
+用法:
+  python3 scripts/generate_h5.py csi300          # 默认
+  python3 scripts/generate_h5.py csi1000
+  python3 scripts/generate_h5.py csi300 --output /tmp/mydata.h5
+  python3 scripts/generate_h5.py --help
+"""
+from __future__ import annotations
+
 import gc
 import os
 import shutil
 import sys
-import tempfile
+from argparse import ArgumentParser
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-# ── Paths ────────────────────────────────────────────────────────────
-ROOT = Path(__file__).resolve().parents[2]
+# ── Paths ──
+ROOT = Path(__file__).resolve().parents[1]
 EXTRA_DATA = ROOT / "tushare" / "extra_data"
-OUT_DIR = Path(__file__).resolve().parent
+INSTRUMENTS = ROOT / "tushare" / "cn_data" / "instruments"
+DEFAULT_OUTPUT_DIR = ROOT / "rdagent_workspace" / "factor_data_template"
 
-# ── Output column order (58 fields, with $ prefix) ───────────────────
+# ── 58 fields ──
 MARKET_FIELDS = [
     "$adjclose", "$amount", "$change", "$close", "$factor",
     "$high", "$low", "$open", "$volume", "$vwap",
@@ -46,10 +53,10 @@ FINANCIAL_FIELDS = [
     "$ocf", "$icf", "$fcf",
     "$liab_to_eqty", "$op_to_revenue", "$ocf_to_profit", "$ocf_to_assets",
 ]
-ALL_OUTPUT_FIELDS = MARKET_FIELDS + VALUATION_FIELDS + FUNDAMENTAL_FIELDS + FINANCIAL_FIELDS
+ALL_FIELDS = MARKET_FIELDS + VALUATION_FIELDS + FUNDAMENTAL_FIELDS + FINANCIAL_FIELDS
 
 
-# ── Helpers ──────────────────────────────────────────────────────────
+# ── Helpers ──
 def _safe_div(a, b):
     with np.errstate(divide="ignore", invalid="ignore"):
         return np.where(b != 0, a / b, np.nan)
@@ -68,7 +75,6 @@ def _load_csv(path: Path) -> pd.DataFrame | None:
 
 
 def _forward_fill(df: pd.DataFrame, col: str, calendar_compact: list[str]) -> np.ndarray:
-    """Forward-fill a quarterly column (ann_date) to the daily calendar."""
     sub = df[["ann_date", col]].dropna(subset=[col, "ann_date"])
     if sub.empty:
         return np.full(len(calendar_compact), np.nan, dtype=np.float32)
@@ -80,13 +86,13 @@ def _forward_fill(df: pd.DataFrame, col: str, calendar_compact: list[str]) -> np
     for i, cd in enumerate(calendar_compact):
         cc = cd.replace("-", "")
         while ai < len(ann) and ann[ai] <= cc:
-            cur = vals[ai]; ai += 1
+            cur = vals[ai]
+            ai += 1
         result[i] = cur
     return result
 
 
 def _align_daily(df: pd.DataFrame, col: str, calendar_compact: list[str]) -> np.ndarray:
-    """Exact match of trade_date to calendar."""
     sub = df[["trade_date", col]].dropna(subset=[col])
     if sub.empty:
         return np.full(len(calendar_compact), np.nan, dtype=np.float32)
@@ -119,11 +125,9 @@ def _build_calendar(dirs: list[Path]) -> list[str]:
     return sorted(dates)
 
 
-# ── Per-stock extraction ─────────────────────────────────────────────
+# ── Per-stock extraction ──
 def extract_stock(stock_dir: Path, calendar_compact: list[str]) -> dict[str, np.ndarray]:
-    """Extract all 58 fields for one stock, aligned to the global calendar."""
     sym = stock_dir.name
-    inst = sym.upper()
     n = len(calendar_compact)
     nan = lambda: np.full(n, np.nan, dtype=np.float32)
     arrays: dict[str, np.ndarray] = {}
@@ -151,7 +155,7 @@ def extract_stock(stock_dir: Path, calendar_compact: list[str]) -> dict[str, np.
             if latest_af > 0:
                 _adj_ratio = (af / latest_af).astype(np.float32)
 
-    # ── Market (10) from daily.csv ──
+    # Market (10)
     if daily is not None:
         arrays["$open"]   = _align_daily(daily, "open",   calendar_compact)
         arrays["$high"]   = _align_daily(daily, "high",   calendar_compact)
@@ -159,8 +163,8 @@ def extract_stock(stock_dir: Path, calendar_compact: list[str]) -> dict[str, np.
         arrays["$close"]  = _align_daily(daily, "close",  calendar_compact)
         arrays["$volume"] = _align_daily(daily, "vol",    calendar_compact)
         arrays["$amount"] = _align_daily(daily, "amount", calendar_compact)
-
-        vol = arrays["$volume"]; amt = arrays["$amount"]
+        vol = arrays["$volume"]
+        amt = arrays["$amount"]
         arrays["$vwap"] = _safe_div(amt, vol).astype(np.float32)
 
         if _adj_ratio is not None:
@@ -188,7 +192,7 @@ def extract_stock(stock_dir: Path, calendar_compact: list[str]) -> dict[str, np.
         for f in MARKET_FIELDS:
             arrays[f] = nan()
 
-    # ── Valuation (15) from daily_basic.csv ──
+    # Valuation (15)
     _vb = [
         ("pe", "$pe"), ("pe_ttm", "$pe_ttm"), ("pb", "$pb"),
         ("ps", "$ps"), ("ps_ttm", "$ps_ttm"),
@@ -202,7 +206,7 @@ def extract_stock(stock_dir: Path, calendar_compact: list[str]) -> dict[str, np.
     for csv_col, out_name in _vb:
         arrays[out_name] = _align_daily(dbasic, csv_col, calendar_compact) if dbasic is not None else nan()
 
-    # ── Fundamental (20) from fina_indicator.csv ──
+    # Fundamental (20)
     _fm = [
         ("eps", "$eps"), ("dt_eps", "$dt_eps"), ("bps", "$bps"),
         ("ocfps", "$ocfps"), ("cfps", "$cfps"), ("revenue_ps", "$revenue_ps"),
@@ -217,7 +221,7 @@ def extract_stock(stock_dir: Path, calendar_compact: list[str]) -> dict[str, np.
     for csv_col, out_name in _fm:
         arrays[out_name] = _forward_fill(fina, csv_col, calendar_compact) if fina is not None else nan()
 
-    # ── Financial statements (13) — merge income+balancesheet+cashflow on ann_date ──
+    # Financial statements (13)
     _fs_sources = {
         "income":        ["total_revenue", "n_income", "operate_profit"],
         "balancesheet":  ["total_assets", "total_liab", "total_hldr_eqy_exc_min_int"],
@@ -245,14 +249,16 @@ def extract_stock(stock_dir: Path, calendar_compact: list[str]) -> dict[str, np.
         for csv_col, out_name in _fo:
             arrays[out_name] = _forward_fill(merged, csv_col, calendar_compact) if csv_col in merged.columns else nan()
 
-        ta = arrays.get("$total_assets"); tl = arrays.get("$total_liab")
-        op = arrays.get("$operate_profit"); tr_arr = arrays.get("$revenue")
-        oc = arrays.get("$ocf"); ni = arrays.get("$n_income")
-
-        arrays["$liab_to_eqty"]   = _safe_div(tl, (ta - tl)).astype(np.float32) if ta is not None and tl is not None else nan()
-        arrays["$op_to_revenue"]  = (_safe_div(op, tr_arr) * 100).astype(np.float32) if op is not None and tr_arr is not None else nan()
-        arrays["$ocf_to_profit"]  = _safe_div(oc, ni).astype(np.float32) if oc is not None and ni is not None else nan()
-        arrays["$ocf_to_assets"]  = (_safe_div(oc, ta) * 100).astype(np.float32) if oc is not None and ta is not None else nan()
+        ta = arrays.get("$total_assets")
+        tl = arrays.get("$total_liab")
+        op = arrays.get("$operate_profit")
+        tr_arr = arrays.get("$revenue")
+        oc = arrays.get("$ocf")
+        ni = arrays.get("$n_income")
+        arrays["$liab_to_eqty"]  = _safe_div(tl, (ta - tl)).astype(np.float32) if ta is not None and tl is not None else nan()
+        arrays["$op_to_revenue"] = (_safe_div(op, tr_arr) * 100).astype(np.float32) if op is not None and tr_arr is not None else nan()
+        arrays["$ocf_to_profit"] = _safe_div(oc, ni).astype(np.float32) if oc is not None and ni is not None else nan()
+        arrays["$ocf_to_assets"] = (_safe_div(oc, ta) * 100).astype(np.float32) if oc is not None and ta is not None else nan()
     else:
         for f in FINANCIAL_FIELDS:
             arrays[f] = nan()
@@ -260,17 +266,22 @@ def extract_stock(stock_dir: Path, calendar_compact: list[str]) -> dict[str, np.
     return arrays
 
 
-# ── Parallel chunk worker ────────────────────────────────────────────
+# ── Index filter ──
+def load_current_index_stocks(index_name: str) -> set[str]:
+    """Load current constituent symbols from index file."""
+    path = INSTRUMENTS / f"{index_name}.txt"
+    if not path.exists():
+        print(f"ERROR: 指数文件不存在: {path}")
+        sys.exit(1)
+    df = pd.read_csv(path, sep="\t", header=None, names=["code", "join", "leave"])
+    latest_leave = df["leave"].max()
+    current = set(df[df["leave"] == latest_leave]["code"].unique())
+    print(f"  {index_name}: {len(df)} 条记录, {len(current)} 当前成分股")
+    return current
 
+
+# ── Parallel worker ──
 def _process_chunk(args):
-    """Worker: process a chunk of stocks, write to temporary parquet.
-
-    Args:
-        args: (stock_dirs, calendar, calendar_compact, tmp_path, chunk_id)
-
-    Returns:
-        (chunk_id, tmp_path, n_rows) or (chunk_id, None, 0) if empty
-    """
     stock_dirs, calendar, cal_compact, tmp_path, chunk_id = args
     frames = {}
     for sd in stock_dirs:
@@ -284,7 +295,7 @@ def _process_chunk(args):
     if not frames:
         return (chunk_id, None, 0)
 
-    chunk_df = pd.concat(frames.values())[ALL_OUTPUT_FIELDS]
+    chunk_df = pd.concat(frames.values())[ALL_FIELDS]
     n_rows = len(chunk_df)
     chunk_df.to_hdf(tmp_path, key="chunk", mode="w", complevel=1, complib="zlib")
     del frames, chunk_df
@@ -292,112 +303,114 @@ def _process_chunk(args):
     return (chunk_id, tmp_path, n_rows)
 
 
-# ── Main ─────────────────────────────────────────────────────────────
+# ── Main ──
 def main():
-    if not EXTRA_DATA.exists():
-        print(f"ERROR: extra_data not found at {EXTRA_DATA}")
+    parser = ArgumentParser(description="按指数生成 HDF5 数据文件")
+    parser.add_argument("index", nargs="?", default="csi300",
+                        choices=["csi300", "csi1000", "csi500", "csi800", "all"],
+                        help="指数名称 (默认: csi300)")
+    parser.add_argument("--output", "-o", default=None,
+                        help="输出 H5 文件路径 (默认: rdagent_workspace/factor_data_template/daily_pv_{index}.h5)")
+    parser.add_argument("--workers", "-w", type=int, default=0,
+                        help="并行 worker 数 (默认: min(cpu_count, 16))")
+    args = parser.parse_args()
+
+    num_workers = args.workers if args.workers > 0 else min(cpu_count(), 16)
+
+    # ── 确定输出路径 ──
+    if args.output:
+        out_path = Path(args.output).expanduser().resolve()
+    else:
+        out_path = DEFAULT_OUTPUT_DIR / f"daily_pv_{args.index}.h5"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"指数: {args.index}")
+    print(f"输出: {out_path}")
+    print(f"Workers: {num_workers}")
+
+    # ── 加载成分股列表 ──
+    current_codes = load_current_index_stocks(args.index)
+
+    # ── 匹配 extra_data 目录 ──
+    stock_dirs = [
+        EXTRA_DATA / code
+        for code in current_codes
+        if (EXTRA_DATA / code).is_dir() and (EXTRA_DATA / code / "daily.csv").exists()
+    ]
+    missing = current_codes - {d.name for d in stock_dirs}
+    if missing:
+        print(f"  extra_data 中缺失: {len(missing)} 只 ({', '.join(sorted(missing)[:10])}{'...' if len(missing) > 10 else ''})")
+    print(f"  extra_data 有数据: {len(stock_dirs)} 只")
+
+    if not stock_dirs:
+        print("ERROR: 没有可用的股票数据，终止")
         sys.exit(1)
 
-    _env_workers = os.environ.get("GENERATE_NUM_WORKERS", "")
-    NUM_WORKERS = int(_env_workers) if _env_workers else min(cpu_count(), 16)
-    # Explicit env override takes priority; default uses cpu_count capped at 16
-    print(f"Workers: {NUM_WORKERS}")
-
-    stock_dirs = sorted(d for d in EXTRA_DATA.iterdir() if d.is_dir() and (d / "daily.csv").exists())
-    print(f"Stock dirs with daily.csv: {len(stock_dirs)}")
-
-    # ── Phase 1: Build global calendar (sequential, fast) ──
-    print("Building global calendar ...", end=" ", flush=True)
+    # ── 构建日历 ──
+    print("构建日历...", end=" ", flush=True)
     calendar = _build_calendar(stock_dirs)
     cal_compact = [d.replace("-", "") for d in calendar]
-    print(f"{len(calendar)} trading days ({calendar[0]} ~ {calendar[-1]})")
+    print(f"{len(calendar)} 个交易日 ({calendar[0]} ~ {calendar[-1]})")
 
-    # ── Phase 2: Process stocks in parallel (16 workers) ──
-    # Split stock_dirs into chunks, one per worker
-    chunk_size = max(1, len(stock_dirs) // NUM_WORKERS)
+    # ── 分片 ──
+    chunk_size = max(1, len(stock_dirs) // num_workers)
     chunks = [stock_dirs[i:i + chunk_size] for i in range(0, len(stock_dirs), chunk_size)]
-    print(f"Chunks: {len(chunks)} (avg {chunk_size} stocks/chunk)")
+    print(f"分片: {len(chunks)} (平均 {chunk_size} 只/片)")
 
-    # Temporary directory for intermediate files (use OUT_DIR so Docker mount has fast I/O)
-    tmp_dir = os.environ.get("GENERATE_TMP_DIR",
-        str(OUT_DIR / f".h5gen_tmp_{os.getpid()}"))
-    os.makedirs(tmp_dir, exist_ok=True)
-    print(f"Temp dir: {tmp_dir}")
+    tmp_dir = Path(out_path.parent) / f".h5gen_{args.index}_{os.getpid()}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    print(f"临时目录: {tmp_dir}")
 
-    # Build args for each worker
     worker_args = [
-        (chunk, calendar, cal_compact, os.path.join(tmp_dir, f"chunk_{i:03d}.h5"), i)
+        (chunk, calendar, cal_compact, str(tmp_dir / f"chunk_{i:03d}.h5"), i)
         for i, chunk in enumerate(chunks)
     ]
 
-    print(f"Processing {len(stock_dirs)} stocks with {NUM_WORKERS} workers ...")
-    with Pool(NUM_WORKERS) as pool:
+    print(f"处理 {len(stock_dirs)} 只股票...")
+    with Pool(num_workers) as pool:
         results = pool.map(_process_chunk, worker_args)
 
-    # ── Phase 3: Collect results from parquet files ──
-    parquet_paths = []
+    # ── 收集合并 ──
+    h5_paths = []
     total_rows = 0
     for chunk_id, path, n_rows in sorted(results, key=lambda x: x[0]):
         if path is not None and n_rows > 0:
-            parquet_paths.append(path)
+            h5_paths.append(path)
             total_rows += n_rows
-    print(f"Collected {len(parquet_paths)} parquet files ({total_rows} rows)")
+    print(f"收集 {len(h5_paths)} 个分片 ({total_rows} 行)")
 
-    # Batch concat: merge 4-5 chunks at a time to control peak memory
-    print("Concatenating ...", end=" ", flush=True)
-    out_all = OUT_DIR / "daily_pv_all.h5"
-    BATCH_SIZE = max(1, min(4, len(parquet_paths) // 4))
+    print("合并中...", end=" ", flush=True)
+    BATCH_SIZE = max(1, min(4, len(h5_paths) // 4))
     merged_paths = []
 
-    for bi in range(0, len(parquet_paths), BATCH_SIZE):
-        batch = parquet_paths[bi:bi + BATCH_SIZE]
+    for bi in range(0, len(h5_paths), BATCH_SIZE):
+        batch = h5_paths[bi:bi + BATCH_SIZE]
         frames = [pd.read_hdf(p, key="chunk") for p in batch]
         batch_df = pd.concat(frames)
         del frames
         gc.collect()
-        merged_path = os.path.join(tmp_dir, f"merged_{bi:03d}.h5")
-        batch_df.to_hdf(merged_path, key="chunk", mode="w", complevel=1, complib="zlib")
-        merged_paths.append(merged_path)
-        print(f"[{bi + len(batch)}/{len(parquet_paths)}]", end=" ", flush=True)
+        mp = str(tmp_dir / f"merged_{bi:03d}.h5")
+        batch_df.to_hdf(mp, key="chunk", mode="w", complevel=1, complib="zlib")
+        merged_paths.append(mp)
         del batch_df
         gc.collect()
 
-    # Final merge of merged batches
-    print("final ...", end=" ", flush=True)
-    frames = []
-    for mp in merged_paths:
-        frames.append(pd.read_hdf(mp, key="chunk"))
+    frames = [pd.read_hdf(mp, key="chunk") for mp in merged_paths]
     data = pd.concat(frames).sort_index()
     del frames
     gc.collect()
 
-    # ── Write HDF5 ──
-    data.to_hdf(str(out_all), key="data", mode="w")
-    print(f"full shape={data.shape}")
+    # ── 写入 ──
+    data.to_hdf(str(out_path), key="data", mode="w")
+    print(f"写入完成: shape={data.shape}")
+    print(f"  datetime 范围: {data.index.get_level_values('datetime').min()} ~ {data.index.get_level_values('datetime').max()}")
+    insts = data.index.get_level_values("instrument").unique()
+    print(f"  instrument 数量: {len(insts)}")
 
-    # Debug: first 300 instruments, 2020-2024
-    debug_inst = sorted(data.index.get_level_values("instrument").unique())[:300]
-    ds = os.environ.get("GENERATE_DEBUG_START", "2020-01-01")
-    de = os.environ.get("GENERATE_DEBUG_END", "2024-12-31")
-    mask = (data.index.get_level_values("instrument").isin(debug_inst)
-            & (data.index.get_level_values("datetime") >= ds)
-            & (data.index.get_level_values("datetime") <= de))
-    debug = data.loc[mask].copy()
-    print(f"Debug shape={debug.shape}  instruments={len(debug_inst)}  range=[{ds}, {de}]")
-    out_debug = OUT_DIR / "daily_pv_debug.h5"
-    debug.to_hdf(str(out_debug), key="data", mode="w")
-    print(f"{out_debug} written")
-    del data, debug
-    gc.collect()
-
-    # ── Cleanup ──
-    if os.environ.get("GENERATE_KEEP_TMP") != "1":
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        print(f"Cleaned up {tmp_dir}")
-    else:
-        print(f"Kept temp dir: {tmp_dir}")
-
-    print("Done.")
+    # ── 清理 ──
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    print(f"清理临时目录: {tmp_dir}")
+    print("完成。")
 
 
 if __name__ == "__main__":

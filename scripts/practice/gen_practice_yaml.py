@@ -83,6 +83,13 @@ def patch_yaml(
     # ──────────────────────────────────────────
     dh = doc.get("data_handler_config", {})
     handler_start = data_start or dates["train_start"]
+
+    # 从环境变量或参数读取 market (默认 all)
+    _market = os.getenv("TARGET_MARKET", "").strip() or "all"
+    dh["instruments"] = _market
+    if "market" in doc:
+        doc["market"] = _market
+
     # handler 的全局时间范围覆盖训练+验证+测试
     dh["start_time"]     = handler_start
     dh["end_time"]       = dates["test_end"]
@@ -103,6 +110,7 @@ def patch_yaml(
     hkw = doc["task"]["dataset"]["kwargs"]["handler"]
     if isinstance(hkw, dict) and "kwargs" in hkw:
         hkw["kwargs"].update(
+            instruments=_market,
             start_time=handler_start,
             end_time=dates["test_end"],
             fit_start_time=dates["train_start"],
@@ -131,7 +139,18 @@ def patch_yaml(
     bt["account"] = cash_total
 
     # ──────────────────────────────────────────
-    # 4. 写出
+    # 4. 移除 PortAnaRecord (cn_extra_data 无 benchmark 数据)
+    #    walk-forward full backtest 已负责性能评估
+    # ──────────────────────────────────────────
+    records = doc.get("task", {}).get("record", [])
+    if isinstance(records, list):
+        doc["task"]["record"] = [
+            r for r in records
+            if not (isinstance(r, dict) and r.get("class") == "PortAnaRecord")
+        ]
+
+    # ──────────────────────────────────────────
+    # 5. 写出
     # ──────────────────────────────────────────
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:

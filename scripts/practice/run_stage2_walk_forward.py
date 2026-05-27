@@ -50,6 +50,11 @@ import numpy as np
 import pandas as pd
 import yaml
 
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None  # type: ignore[assignment,misc]
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts" / "practice"
@@ -1056,6 +1061,76 @@ def _copy_fold_outputs(src_dir: Path, dst_dir: Path) -> None:
             shutil.copy2(src, dst_dir / name)
 
 
+def _aggregate_factor_ic_across_folds(
+    wf_root: Path, model_name: str, output_root: Path
+) -> None:
+    """Aggregate per-factor IC and feature importance across all completed folds.
+
+    Scans each fold's mlflow artifacts for factor_ic_valid.pkl,
+    factor_ic_test.pkl, and feature_importance.pkl, then writes
+    factor_ic_summary.csv and feature_importance_summary.csv.
+    """
+    fic_valid_list, fic_test_list, fi_list = [], [], []
+
+    for fold_dir in sorted(wf_root.iterdir()):
+        if not fold_dir.is_dir():
+            continue
+        artifacts_dir = fold_dir / "model_runs" / model_name / "mlflow_run" / "artifacts"
+        if not artifacts_dir.is_dir():
+            continue
+
+        fold_tag = fold_dir.name
+
+        for fname, collector in [
+            ("factor_ic_valid.pkl", fic_valid_list),
+            ("factor_ic_test.pkl", fic_test_list),
+            ("feature_importance.pkl", fi_list),
+        ]:
+            path = artifacts_dir / fname
+            if path.exists():
+                try:
+                    df = pd.read_pickle(path)
+                    if not df.empty:
+                        df["fold_tag"] = fold_tag
+                        collector.append(df)
+                except Exception:
+                    pass
+
+    def _write_summary(df_list, output_name, group_cols, agg_cols):
+        if not df_list:
+            return
+        combined = pd.concat(df_list, ignore_index=True)
+        if combined.empty:
+            return
+        summary = combined.groupby("factor").agg(agg_cols).reset_index()
+        if "mean_RankIC" in summary.columns:
+            summary = summary.sort_values(
+                "mean_RankIC", key=abs, ascending=False, na_position="last"
+            )
+        path = output_root / output_name
+        summary.to_csv(path, index=False, encoding="utf-8-sig")
+        print(f"  {output_name}: {path} ({len(summary)} factors, {len(df_list)} folds)")
+
+    _agg_ic = {
+        "mean_RankIC": "mean",
+        "IR_RankIC": "mean",
+        "pos_RankIC": "mean",
+        "mean_PearsonIC": "mean",
+        "IR_PearsonIC": "mean",
+        "pos_PearsonIC": "mean",
+        "n_dates": "sum",
+    }
+    _agg_fi = {
+        "gain_pct": "mean",
+        "split_pct": "mean",
+    }
+
+    print("\n--- Cross-Fold Factor IC Aggregation ---")
+    _write_summary(fic_valid_list, "factor_ic_summary_valid.csv", ["factor"], _agg_ic)
+    _write_summary(fic_test_list, "factor_ic_summary_test.csv", ["factor"], _agg_ic)
+    _write_summary(fi_list, "feature_importance_summary.csv", ["factor"], _agg_fi)
+
+
 def _generate_summary(fold_rows: list[dict[str, object]], output_root: Path) -> None:
     if not fold_rows:
         return
@@ -1173,6 +1248,206 @@ def _build_full_signal(fold_outputs: list[Path]) -> pd.DataFrame:
     signal_df = signal_df.set_index(["datetime", "instrument"])[["score"]]
     signal_df.index = signal_df.index.set_names(["datetime", "instrument"])
     return signal_df
+
+
+def _resolve_qlib_instrument(code: str) -> str:
+    """Convert a 6-digit code to qlib instrument format (SH600000 / SZ000001)."""
+    code = str(code).strip().zfill(6)
+    if code.startswith(("6", "9")):
+        return f"SH{code}"
+    return f"SZ{code}"
+
+
+def _extract_6digit(code: str) -> str:
+    """Extract a bare 6-digit code from various formats."""
+    return str(code).strip().replace("SH", "").replace("SZ", "").replace("sh", "").replace("sz", "").zfill(6)
+
+
+def _deepseek_call(prompt: str) -> str:
+    """Call DeepSeek API and return the response content.
+
+    Returns empty string on any error. Prints diagnostics for debugging.
+    """
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        print("  ⚠ DEEPSEEK_API_KEY not set — skipping DeepSeek call")
+        return ""
+    if OpenAI is None:
+        print("  ⚠ openai package not installed — skipping DeepSeek call")
+        return ""
+
+    api_base = os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1").strip()
+    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat").strip()
+
+    try:
+        client = OpenAI(api_key=api_key, base_url=api_base, timeout=30.0)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=200,
+        )
+        content = response.choices[0].message.content or ""
+        if not content.strip():
+            print(f"  ⚠ DeepSeek returned empty response (finish_reason={response.choices[0].finish_reason})")
+        return content
+    except Exception as exc:
+        print(f"  ⚠ DeepSeek API call failed: {type(exc).__name__}: {exc}")
+        return ""
+
+
+def _deepseek_select_stocks(
+    scores_df: pd.DataFrame,
+    hold_num: int = 5,
+    previous_holdings: set | None = None,
+    candidate_pool_size: int = 20,
+) -> list[str]:
+    """Use DeepSeek-flash to select stocks from top candidates.
+
+    Week 1 (no previous_holdings):
+        Picks hold_num stocks from top candidate_pool_size by model score.
+    Week 2+ (previous_holdings provided):
+        Keeps holdings still in top 50% rank; for those that dropped,
+        calls DeepSeek to pick replacements from the candidate pool.
+
+    Prompt: 基于当前股价、基本面、财务、估值等方面选出最应该买入的股票，
+            若都不建议买入则返回空。
+
+    Returns list of qlib instrument codes (SH600000, SZ000001, etc.).
+    Falls back to top-N by model score on any error.
+    """
+    import re
+
+    score_col = "score_final" if "score_final" in scores_df.columns else "score"
+    instrument_col = "instrument" if "instrument" in scores_df.columns else "code"
+    rank_col = "rank" if "rank" in scores_df.columns else None
+    total_stocks = len(scores_df)
+
+    # Ensure code column exists for matching
+    scores_df = scores_df.copy()
+    if "code" not in scores_df.columns:
+        scores_df["code"] = scores_df[instrument_col].astype(str).apply(_extract_6digit)
+    scores_df["code"] = scores_df["code"].astype(str).str.zfill(6)
+
+    def _codes_to_instruments(codes: list[str]) -> list[str]:
+        result = []
+        for c in codes:
+            qlib_code = _resolve_qlib_instrument(c)
+            if qlib_code not in result:
+                result.append(qlib_code)
+        return result
+
+    # Check if DeepSeek is available
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        print("  ⚠ DEEPSEEK_API_KEY not set — falling back to top-N by model score")
+        top_codes = scores_df.sort_values(score_col, ascending=False).head(hold_num)["code"].tolist()
+        return _codes_to_instruments(top_codes)
+
+    if OpenAI is None:
+        print("  ⚠ openai package not installed — falling back to top-N by model score")
+        top_codes = scores_df.sort_values(score_col, ascending=False).head(hold_num)["code"].tolist()
+        return _codes_to_instruments(top_codes)
+
+    # Build top candidate pool
+    top_pool = scores_df.sort_values(score_col, ascending=False).head(candidate_pool_size)
+
+    # ── Determine current holdings and replacements needed ──
+    keep_codes: list[str] = []
+    n_replace = hold_num  # how many to select via DeepSeek
+
+    if previous_holdings:
+        prev_set = {_extract_6digit(c) for c in previous_holdings}
+        # Find previous holdings in current scores
+        prev_in_scores = scores_df[scores_df["code"].isin(prev_set)]
+        threshold_rank = total_stocks // 2  # top 50% threshold
+
+        for _, row in prev_in_scores.iterrows():
+            code = str(row["code"]).zfill(6)
+            if rank_col is not None and pd.notna(row.get(rank_col)):
+                r = int(row[rank_col])
+                if r <= threshold_rank:
+                    keep_codes.append(code)
+
+        dropped_count = len(prev_set) - len(keep_codes)
+        if dropped_count > 0:
+            print(f"  🔄 前周持仓 {len(prev_set)} 只，保留 {len(keep_codes)} 只 (仍在前50%)，需替换 {dropped_count} 只")
+            n_replace = dropped_count
+        else:
+            print(f"  ✓ 前周持仓 {len(prev_set)} 只全部仍在前50%，无需替换")
+            return _codes_to_instruments(keep_codes[:hold_num])
+    else:
+        print(f"  🆕 首周建仓，从 top {candidate_pool_size} 中选出 {hold_num} 只")
+
+    if n_replace <= 0:
+        return _codes_to_instruments(keep_codes[:hold_num])
+
+    # Candidate pool for replacements: top_pool excluding already-kept codes
+    kept_set = set(keep_codes)
+    candidates = top_pool[~top_pool["code"].isin(kept_set)]
+    if candidates.empty:
+        # Fall back to top_pool excluding kept
+        candidates = scores_df.sort_values(score_col, ascending=False)
+        candidates = candidates[~candidates["code"].isin(kept_set)]
+    candidates = candidates.head(candidate_pool_size)
+
+    if candidates.empty:
+        print("  ⚠ 候选池为空 — 仅保留现有持仓")
+        return _codes_to_instruments(keep_codes[:hold_num])
+
+    # Build prompt
+    cand_codes = candidates["code"].astype(str).str.zfill(6).tolist()
+    cand_lines = "\n".join(f"{i + 1}. {c}" for i, c in enumerate(cand_codes))
+
+    if previous_holdings and dropped_count > 0:
+        dropped_codes = [_extract_6digit(c) for c in previous_holdings if _extract_6digit(c) not in kept_set]
+        prompt = (
+            f"当前持仓中以下股票最新排名已跌出前50%，需要替换: {', '.join(dropped_codes)}。\n"
+            f"请基于当前股价、基本面、财务、估值等方面，从以下候选池中选出{n_replace}支最应该买入的股票。"
+            f"只返回{n_replace}个6位股票代码，每行一个。若都不建议买入则返回空。\n"
+            f"候选池:\n{cand_lines}"
+        )
+    else:
+        prompt = (
+            f"请基于当前股价、基本面、财务、估值等方面，从以下{candidate_pool_size}支股票中选出当前最应该买入的"
+            f"{n_replace}支股票。只返回{n_replace}个6位股票代码，每行一个。若都不建议买入则返回空。\n"
+            f"候选池:\n{cand_lines}"
+        )
+
+    content = _deepseek_call(prompt)
+
+    # Parse codes from response
+    found = re.findall(r"\b(\d{6})\b", content)
+    selected = []
+    for code in found:
+        qlib_code = _resolve_qlib_instrument(code)
+        if qlib_code not in selected:
+            selected.append(qlib_code)
+
+    if not found:
+        print(f"  ⚠ DeepSeek 未返回有效股票代码，使用模型 top-{n_replace} 代替")
+    else:
+        print(f"  🤖 DeepSeek 选出: {[c[-6:] for c in selected[:n_replace]]}")
+
+    # Combine: keep existing good holdings + new DeepSeek selections
+    result_codes = keep_codes.copy()
+    for code in selected:
+        bare = code.replace("SH", "").replace("SZ", "")
+        if bare not in [c.replace("SH", "").replace("SZ", "") for c in result_codes]:
+            result_codes.append(bare)
+        if len(result_codes) >= hold_num:
+            break
+
+    # Fill remaining slots from top-N by score if needed
+    if len(result_codes) < hold_num:
+        fallback = scores_df.sort_values(score_col, ascending=False)
+        fallback = fallback[~fallback["code"].isin({_extract_6digit(c) for c in result_codes})]
+        for _, row in fallback.head(hold_num - len(result_codes)).iterrows():
+            code = str(row["code"]).zfill(6)
+            if code not in result_codes:
+                result_codes.append(code)
+
+    return _codes_to_instruments(result_codes[:hold_num])
 
 
 def _backtest_metrics_from_report(report_df: pd.DataFrame) -> dict[str, float]:
@@ -1526,8 +1801,48 @@ def _stage36_replay_signal_from_fold(
     pred_date: str,
     hold_num: int,
     market: str,
+    previous_holdings: set | None = None,
 ) -> pd.DataFrame:
-    """Replay stage3~stage6 for one fold and convert the final portfolio into a trade signal."""
+    """Replay stage3~stage6 for one fold and convert the final portfolio into a trade signal.
+
+    When USE_DEEPSEEK=1, bypasses the stage3-6 chain and calls DeepSeek API
+    directly to select the best stocks from the top 20 model predictions.
+    """
+    # DeepSeek fast path: skip stage3-6, query LLM directly
+    if os.environ.get("USE_DEEPSEEK", "").strip().lower() in ("1", "true", "yes"):
+        scores_csv = pred_dir / "scores.csv"
+        if scores_csv.exists():
+            scores_df = pd.read_csv(scores_csv)
+            codes: list[str] = []
+            # Check for pre-computed selections file (host bridge for Docker networking)
+            selections_file = os.environ.get("DEEPSEEK_SELECTIONS_FILE", "").strip()
+            if selections_file:
+                sel_path = Path(selections_file)
+                if sel_path.exists():
+                    import json as _json
+                    with open(sel_path) as _f:
+                        selections_map = _json.load(_f)
+                    codes_str = selections_map.get(pred_date, "")
+                    codes_6 = [c.strip() for c in codes_str.split(",") if c.strip()] if codes_str else []
+                    codes = [_resolve_qlib_instrument(c) for c in codes_6]
+                    if codes:
+                        print(f"  📋 从预计算文件读取 DeepSeek 选股: {codes_6}")
+            if not codes:
+                codes = _deepseek_select_stocks(
+                    scores_df,
+                    hold_num=hold_num,
+                    previous_holdings=previous_holdings,
+                )
+            trade_dt = pd.to_datetime(pred_date)
+            if not codes:
+                return pd.DataFrame(columns=["score"])
+            out = pd.DataFrame({
+                "datetime": trade_dt,
+                "instrument": codes,
+                "score": [1.0 / max(len(codes), 1)] * len(codes),
+            })
+            return out
+
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
     from scripts.practice.stage3_first_screen import first_screen
@@ -1552,7 +1867,7 @@ def _stage36_replay_signal_from_fold(
     )
     risk_eval(str(stage3_dir / "first_screen.csv"), str(stage4_dir), pred_date)
     second_screen(str(stage4_dir / "risk_eval.csv"), str(pred_dir), str(stage5_dir), hold_num=hold_num)
-    final_result(str(stage5_dir / "second_screen.csv"), str(pred_dir), str(stage6_dir), hold_num=hold_num)
+    final_result(str(stage5_dir / "second_screen.csv"), str(pred_dir), str(stage6_dir), hold_num=hold_num, previous_holdings=previous_holdings)
 
     result_update_csv = stage6_dir / "result_update.csv"
     if not result_update_csv.exists():
@@ -1588,9 +1903,14 @@ def _build_stage36_full_signal(
     hold_num: int,
     market: str,
 ) -> pd.DataFrame:
-    """Build a weekly continuous replay signal from stage3~stage6 outputs."""
+    """Build a weekly continuous replay signal from stage3~stage6 outputs.
+
+    Cross-week holding tracking: the portfolio from week N becomes the
+    previous_holdings for week N+1, enabling realistic turnover decisions.
+    """
     replay_root = output_root / "full_backtest" / "stage36_replay"
     frames: list[pd.DataFrame] = []
+    current_holdings: set[str] = set()  # track holdings across weeks
 
     for plan_item in _build_stage36_replay_plan(fold_outputs):
         pred_date = str(plan_item["pred_date"])
@@ -1609,12 +1929,19 @@ def _build_stage36_full_signal(
                 pred_date=pred_date,
                 hold_num=hold_num,
                 market=market,
+                previous_holdings=current_holdings,
             )
         except Exception as exc:
             print(f"  ⚠ stage3~stage6 weekly replay failed for {fold_tag} @ {pred_date}: {exc}")
             continue
         if not df.empty:
             frames.append(df)
+            # Update holdings for next week (extract 6-digit codes from instrument)
+            next_holdings = set()
+            for inst in df["instrument"].astype(str):
+                code = inst.replace("sh", "").replace("sz", "").lower()
+                next_holdings.add(code)
+            current_holdings = next_holdings
 
     if not frames:
         return pd.DataFrame(columns=["score"])
@@ -2109,7 +2436,22 @@ def _write_full_backtest_report(
     qlib.init(**qlib_init, exp_manager=exp_manager)
 
     backtest_cfg = template_cfg.get("port_analysis_config", {}).get("backtest", {})
-    benchmark = backtest_cfg.get("benchmark", "SH000300")
+    # 从 TARGET_BENCHMARK 或 TARGET_MARKET 动态推断 benchmark
+    _target_benchmark = os.environ.get("TARGET_BENCHMARK", "").strip()
+    if not _target_benchmark:
+        _target_market = str(os.environ.get("TARGET_MARKET", "")).strip().lower()
+        _bm_map = {"csi1000": "SH000852", "csi300": "SH000300", "csi500": "SH000905", "csi800": "SH000906"}
+        _target_benchmark = _bm_map.get(_target_market, "SH000300")
+    benchmark = _target_benchmark or backtest_cfg.get("benchmark", "SH000852")
+    # Fall back to SH000300 if the benchmark doesn't exist in the current provider
+    try:
+        from qlib.data import D as _D
+        _all_inst = _D.list_instruments(_D.instruments(market="all"), freq="day", as_list=True)
+        if benchmark not in _all_inst:
+            print(f"  ⚠ Benchmark {benchmark} not found in data, falling back to SH000300")
+            benchmark = "SH000300"
+    except Exception:
+        pass
     exchange_kwargs = backtest_cfg.get(
         "exchange_kwargs",
         {
@@ -2133,7 +2475,11 @@ def _write_full_backtest_report(
     if len(cal) == 0:
         raise RuntimeError("Unable to load trading calendar for full-cycle backtest")
     end_pos = int(cal.searchsorted(signal_end, side="right")) - 1
-    backtest_end = pd.Timestamp(cal[min(end_pos + 5, len(cal) - 1)])
+    # Leave at least 1 entry at the end so qlib's get_step_time(trade_step)
+    # can access calendar_index + 1 without IndexError.
+    cal_max = max(0, len(cal) - 2)
+    end_pos = min(end_pos, cal_max)
+    backtest_end = pd.Timestamp(cal[min(end_pos + 5, cal_max)])
 
     price_cap = _get_price_cap()
     full_backtest_strategy = str(os.environ.get("FULL_BACKTEST_STRATEGY", "stage36_risk_parity") or "stage36_risk_parity").strip().lower()
@@ -3029,8 +3375,11 @@ def main() -> None:
     # Save fold-level and aggregate reports.
     _generate_summary(fold_rows, output_root)
 
-    # Full-cycle consolidated backtest from all weekly fold signals.
-    _write_full_backtest_report(output_root, Path(args.analysis_root), fold_rows, fold_outputs, template_cfg, args.uri_folder, args.hold_num)
+    # Aggregate per-factor IC across folds
+    _aggregate_factor_ic_across_folds(wf_root, str(MODEL_SPECS[0]["name"]), output_root)
+
+    # Full-cycle consolidated backtest from last fold only.
+    _write_full_backtest_report(output_root, Path(args.analysis_root), fold_rows, fold_outputs[-1:], template_cfg, args.uri_folder, args.hold_num)
 
     print("\n═══════════════════════════════════════════════")
     print(f"Latest fold copied to root output: {latest_fold_tag}")
