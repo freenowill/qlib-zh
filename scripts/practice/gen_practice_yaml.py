@@ -70,6 +70,7 @@ def patch_yaml(
     model_mode: str = "default",
     data_start: str | None = None,
     sample_weight_half_life: int | None = None,
+    handler_cache: str | None = None,
 ) -> None:
     validate_date_order(dates)
 
@@ -118,6 +119,23 @@ def patch_yaml(
         )
 
     # ──────────────────────────────────────────
+    # 2b. 可选: 替换 handler 为缓存版本
+    #     Alpha158 → CachedAlpha158
+    #     AlphaExtra → CachedAlphaExtra
+    # ──────────────────────────────────────────
+    if handler_cache:
+        hkw = doc["task"]["dataset"]["kwargs"]["handler"]
+        orig_class = hkw.get("class", "")
+        cache_class = {
+            "Alpha158": "CachedAlpha158",
+            "AlphaExtra": "CachedAlphaExtra",
+        }.get(orig_class)
+        if cache_class:
+            hkw["class"] = cache_class
+            hkw["module_path"] = "scripts.small.cached_handler"
+            hkw["kwargs"]["cache_path"] = handler_cache
+
+    # ──────────────────────────────────────────
     # 3. 更新 port_analysis_config backtest 时间
     # ──────────────────────────────────────────
     pa = doc.get("port_analysis_config", {})
@@ -139,8 +157,20 @@ def patch_yaml(
     bt["account"] = cash_total
 
     # ──────────────────────────────────────────
-    # 4. 移除 PortAnaRecord (cn_extra_data 无 benchmark 数据)
-    #    walk-forward full backtest 已负责性能评估
+    # 4a. 更新 benchmark: 优先使用 TARGET_BENCHMARK 环境变量
+    # ──────────────────────────────────────────
+    _target_benchmark = os.getenv("TARGET_BENCHMARK", "").strip()
+    if _target_benchmark:
+        # 更新顶层 benchmark
+        doc["benchmark"] = _target_benchmark
+        # 更新 port_analysis_config 中的 benchmark
+        _pa = doc.get("port_analysis_config", {})
+        if _pa and "backtest" in _pa and isinstance(_pa["backtest"], dict):
+            _pa["backtest"]["benchmark"] = _target_benchmark
+
+    # ──────────────────────────────────────────
+    # 4b. 移除 PortAnaRecord (cn_extra_data 无 benchmark 数据)
+    #     walk-forward full backtest 已负责性能评估
     # ──────────────────────────────────────────
     records = doc.get("task", {}).get("record", [])
     if isinstance(records, list):
@@ -175,6 +205,7 @@ def main():
     ap.add_argument("--model-mode", choices=["default", "robust"], default="default", dest="model_mode")
     ap.add_argument("--data-start", default=None, dest="data_start")
     ap.add_argument("--sample-weight-half-life", type=int, default=None, dest="sample_weight_half_life")
+    ap.add_argument("--handler-cache", default=None, dest="handler_cache")
     args = ap.parse_args()
 
     sample_weight_half_life = args.sample_weight_half_life
@@ -199,6 +230,7 @@ def main():
         model_mode=args.model_mode,
         data_start=getattr(args, "data_start", None),
         sample_weight_half_life=sample_weight_half_life,
+        handler_cache=getattr(args, "handler_cache", None),
     )
 
 

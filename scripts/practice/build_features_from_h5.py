@@ -70,6 +70,9 @@ H5_COLUMN_MAP = {
     "roa_yearly": "$roa_yearly",
     "netprofit_yoy": "$netprofit_yoy",
     "npta": "$npta",
+    # v4.0 新增字段 (CSI300 优化因子集: BP, Leverage)
+    "bps": "$bps",
+    "debt_to_assets": "$debt_to_assets",
 }
 
 # 42 个独立因子 (v3.0: v2.0 34 + 新增8)
@@ -575,6 +578,13 @@ def compute_factors_for_stock(raw: dict) -> dict:
                     v_sumd[i] = v_sump[i] - v_sumn[i]
             factors[f"VSUMD{ds}"] = v_sumd
 
+    # ROC120 (扩展窗口, 不在标准 Alpha158 中)
+    roc120 = np.full(n, np.nan, dtype=np.float64)
+    for i in range(120, n):
+        if close[i - 120] > 0 and close[i] > 0:
+            roc120[i] = close[i] / close[i - 120] - 1.0
+    factors["ROC120"] = roc120
+
     # ═══════════════════════════════════════════════════════════
     # 重叠因子 (与 Alpha158 等价, 但仍计算用于参考)
     # ═══════════════════════════════════════════════════════════
@@ -737,6 +747,26 @@ def compute_factors_for_stock(raw: dict) -> dict:
     if dv_ratio_arr is not None:
         factors["DividendYield"] = dv_ratio_arr.astype(np.float64)
 
+    # BP: 账面市值比 (Book-to-Price)
+    bps_arr = raw.get("bps")
+    if bps_arr is not None:
+        factors["BP"] = _safe_div(bps_arr.astype(np.float64), close)
+
+    # ROE: 净资产收益率
+    roe_arr = raw.get("roe_yearly")
+    if roe_arr is not None:
+        factors["ROE"] = roe_arr.astype(np.float64) / 100.0
+
+    # EPS_YoY: EPS 同比增速
+    eps_yoy_arr_new = raw.get("eps_yoy")
+    if eps_yoy_arr_new is not None:
+        factors["EPS_YoY"] = eps_yoy_arr_new.astype(np.float64) / 100.0
+
+    # Leverage: 资产负债率
+    dta_arr = raw.get("debt_to_assets")
+    if dta_arr is not None:
+        factors["Leverage"] = dta_arr.astype(np.float64)
+
     # ── 财务比率季度差分 (Delta = 当期 − 60交易日前) ──
     _DELTA_WINDOW = 60  # 约一个季度
     _delta = lambda arr: np.concatenate([
@@ -789,6 +819,11 @@ def compute_factors_for_stock(raw: dict) -> dict:
 
     # Volatility_10d: std(ret, 10)
     factors["Volatility_10d"] = _rolling_std(ret, 10)
+
+    # Volatility_60d: 60日年化已实现波动率
+    rvol60 = _rolling_std(ret, 60)
+    if rvol60 is not None:
+        factors["Volatility_60d"] = rvol60 * np.sqrt(252)
 
     # avg_turnover_10d: 10日平均换手率
     if turnover is not None:
@@ -960,6 +995,7 @@ SECTOR_RELATIVE_MAP = {
     "Sector_Relative_PB": "PB_Ratio",
     "Sector_Relative_PE": "trailing_PE_ratio",
     "Sector_Relative_DividendYield": "DividendYield",
+    "Sector_Rel_BP": "BP",
 }
 
 
@@ -1112,13 +1148,14 @@ def ensure_benchmark_data(output_dir: Path, calendar: list[str], start_idx: int 
     dst_compact = [d.replace("-", "") for d in calendar]
     dst_data = np.full(len(calendar), np.nan, dtype=np.float32)
 
-    # 构建源日期→索引映射
-    src_date_to_idx = {d: i for i, d in enumerate(src_compact)}
-    # 构建源日期→值映射
+    # 构建源日期→值映射 (考虑 start_idx 偏移)
+    # qlib 二进制格式: raw[0]=start_idx, raw[1:]=从 start_idx 开始的连续数据
+    # 所以 src_data[i] 对应日历位置 (_si + i) 的日期
     src_date_to_val = {}
-    for i, d in enumerate(src_compact):
-        if i < len(src_data) and not np.isnan(src_data[i]):
-            src_date_to_val[d] = src_data[i]
+    for i in range(len(src_data)):
+        cal_pos = _si + i
+        if cal_pos < len(src_compact) and not np.isnan(src_data[i]):
+            src_date_to_val[src_compact[cal_pos]] = src_data[i]
 
     for i, d in enumerate(dst_compact):
         if d in src_date_to_val:
@@ -1139,12 +1176,21 @@ def ensure_benchmark_data(output_dir: Path, calendar: list[str], start_idx: int 
     print(f"  基准 {benchmark}: {n_valid}/{len(calendar)} 个有效日期")
 
     # 添加到 instruments
-    inst_path = output_dir / "instruments" / "all.txt"
+    inst_dir = output_dir / "instruments"
+    inst_path = inst_dir / "all.txt"
     if inst_path.exists():
         first_date = calendar[0]
         last_date = calendar[-1]
+        line = f"{benchmark}\t{first_date}\t{last_date}\n"
         with open(inst_path, "a") as f:
-            f.write(f"{benchmark}\t{first_date}\t{last_date}\n")
+            f.write(line)
+        # 同步到市场专属 instrument 文件 (csi300.txt 等)
+        for market_file in inst_dir.glob("*.txt"):
+            if market_file.name == "all.txt":
+                continue
+            with open(market_file, "a") as f:
+                f.write(line)
+        print(f"  benchmark 已注册到 all.txt 及 {len(list(inst_dir.glob('*.txt'))) - 1} 个市场文件")
 
     return True
 
@@ -1158,12 +1204,18 @@ def normalize_cross_sectional(
     batch_size: int = 400,
     min_stocks_per_date: int = 5,
     min_valid_stocks: int = 10,
+    winsorize: tuple[float, float] | None = (0.01, 0.99),
 ) -> dict:
-    """对每个特征做跨股票截面 z-score 归一化并写回 bin 文件.
+    """对每个特征做跨股票截面 winsorize + z-score 归一化并写回 bin 文件.
+
+    先对每日期截面做 winsorize 缩尾 (移除极端值污染),
+    再计算截面 z-score (mean=0, std=1).
 
     Args:
         min_stocks_per_date: 每个日期至少需要多少只有效股票才做归一化
         min_valid_stocks: 特征层面至少需要多少只有效股票才处理该特征
+        winsorize: (lo_pct, hi_pct) 缩尾分位阈值, None 表示不缩尾.
+                   默认 (0.01, 0.99) 即 1%/99% 缩尾.
     """
     stock_dirs = [feat_root / s.lower() for s in stock_list if (feat_root / s.lower()).is_dir()]
     if not stock_dirs:
@@ -1215,7 +1267,22 @@ def normalize_cross_sectional(
             results[feat] = {"stocks_processed": 0, "dates_normalized": 0}
             continue
 
-        # Phase 2: 每日期横截面 z-score
+        # Phase 2: 截面 winsorize (去极端值污染)
+        if winsorize is not None:
+            lo_pct, hi_pct = winsorize
+            with np.errstate(invalid="ignore"):
+                for t in range(n_dates):
+                    col = all_data[:n_stocks, t]
+                    valid = ~np.isnan(col)
+                    n_valid = valid.sum()
+                    if n_valid < min_stocks_per_date:
+                        continue
+                    lo = np.nanquantile(col, lo_pct)
+                    hi = np.nanquantile(col, hi_pct)
+                    if lo < hi:
+                        col[valid] = np.clip(col[valid], lo, hi)
+
+        # Phase 3: 每日期横截面 z-score
         dates_normalized = 0
         with np.errstate(invalid="ignore"):
             for t in range(n_dates):
@@ -1231,7 +1298,7 @@ def normalize_cross_sectional(
                 all_data[valid, t] = (col[valid] - mean_t) / std_t
                 dates_normalized += 1
 
-        # Phase 3: 写回
+        # Phase 4: 写回
         for i in range(n_stocks):
             if not valid_mask[i]:
                 continue
@@ -1488,31 +1555,8 @@ def main():
         n_ok = sum(1 for v in norm_results.values() if v["stocks_processed"] > 0)
         print(f"  归一化耗时: {time.time() - t_norm:.1f}s ({n_ok}/{len(norms)} 个特征已归一化)")
 
-    # ── 9. Winsorize 极端值 ──
-    _WINSORIZE_FIELDS = [
-        "Delta_roe", "Delta_net_profit_margin",
-        "SUE", "AccrualsRatio", "DebtToEquity",
-        "Amihud_20d", "FCF_Yield", "Skewness_20d", "EPS_Quality",
-    ]
-    print("缩尾极端值 (1%/99%) ...")
-    for sym in stock_list:
-        feat_dir = features_dir / sym.lower()
-        if not feat_dir.is_dir():
-            continue
-        for fname in _WINSORIZE_FIELDS:
-            fpath = feat_dir / f"{fname}{BIN_SUFFIX}"
-            if not fpath.exists():
-                continue
-            data = np.fromfile(str(fpath), dtype="<f4")
-            if len(data) < 2:
-                continue
-            header, vals = data[0], data[1:].copy()
-            valid_vals = vals[~np.isnan(vals)]
-            if len(valid_vals) < 10:
-                continue
-            lo, hi = np.nanquantile(valid_vals, [0.01, 0.99])
-            if lo < hi:
-                np.concatenate([[header], np.clip(vals, lo, hi).astype("<f4")]).tofile(str(fpath))
+    # Winsorize 已集成到 normalize_cross_sectional() 中,
+    # 对所有归一化特征统一做截面缩尾 (1%/99%), 不再单独处理特选因子.
 
     # ── 9. 因子清单 ──
     manifest = {
