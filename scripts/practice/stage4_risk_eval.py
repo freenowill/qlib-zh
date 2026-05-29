@@ -423,6 +423,170 @@ def _financial_score(bundle: dict) -> tuple[float, dict[str, float]]:
     return score, {"prof": prof, "solv": solv, "oper": oper, "grow": grow}
 
 
+def _build_qlib_fallback_result(pool: pd.DataFrame, pred_date: str) -> pd.DataFrame:
+    """When baostock is unavailable, build risk-eval using qlib cn_extra_data_h5.
+
+    Reads PE/PB/PS and financial metrics directly from the qlib data store,
+    avoiding the all-50-neutral fallback.
+    """
+    import qlib
+    from qlib.data import D
+
+    result = pool.copy()
+    if "pred_date" not in result.columns:
+        result["pred_date"] = pred_date
+
+    codes = result["code"].astype(str).str.zfill(6).tolist()
+    instruments = []
+    for c in codes:
+        if c.startswith("6"):
+            instruments.append(f"sh{c}")
+        else:
+            instruments.append(f"sz{c}")
+
+    # Read daily snapshot (PE_TTM, PB, PS, close) at pred_date
+    try:
+        daily_fields = ["$pe_ttm", "$pb", "$ps", "$close"]
+        daily_df = D.features(instruments, daily_fields, start_time=pred_date, end_time=pred_date, freq="day")
+        if daily_df is not None and not daily_df.empty:
+            daily_df = daily_df.reset_index()
+            daily_df["code"] = daily_df["instrument"].astype(str).str.replace(r"^[a-z]+", "", regex=True).str.zfill(6)
+            latest_daily = daily_df.groupby("code").last().reset_index()
+        else:
+            latest_daily = pd.DataFrame(columns=["code"] + daily_fields)
+    except Exception:
+        latest_daily = pd.DataFrame(columns=["code"] + daily_fields)
+
+    # Read financial data from the most recent quarter before pred_date
+    fin_fields = [
+        "$roe_yearly", "$roa_yearly", "$netprofit_margin",
+        "$debt_to_assets", "$eps_yoy", "$revenue_yoy", "$assets_yoy",
+        "$npta",
+    ]
+    try:
+        lookback = pd.Timestamp(pred_date) - pd.DateOffset(months=6)
+        fin_df = D.features(instruments, fin_fields, start_time=lookback.strftime("%Y-%m-%d"),
+                            end_time=pred_date, freq="day")
+        if fin_df is not None and not fin_df.empty:
+            fin_df = fin_df.reset_index()
+            fin_df["code"] = fin_df["instrument"].astype(str).str.replace(r"^[a-z]+", "", regex=True).str.zfill(6)
+            latest_fin = fin_df.groupby("code").last().reset_index()
+            # Forward-fill quarterly data
+            for f in fin_fields:
+                col = f.replace("$", "")
+                if col in latest_fin.columns:
+                    latest_fin[col] = latest_fin[col].replace(0, np.nan)
+        else:
+            latest_fin = pd.DataFrame(columns=["code"] + [f.replace("$", "") for f in fin_fields])
+    except Exception:
+        latest_fin = pd.DataFrame(columns=["code"] + [f.replace("$", "") for f in fin_fields])
+
+    # Load SW industry mapping
+    try:
+        import qlib
+        sw_path = Path(qlib.config.C.get("qlib_data_path", os.path.expanduser("~/.qlib/qlib_data"))) / ".." / ".."
+        # Try to find sw_industry.csv in the workspace
+        sw_csv = Path(os.environ.get("WORKDIR", "/work")) / "tushare" / "cn_data" / "sw_industry.csv"
+        if sw_csv.exists():
+            sw_map = pd.read_csv(sw_csv)
+            sw_map["code"] = sw_map["symbol"].astype(str).str.zfill(6)
+            industry_lookup = dict(zip(sw_map["code"], sw_map["sw_industry"]))
+        else:
+            industry_lookup = {}
+    except Exception:
+        industry_lookup = {}
+
+    # Build result rows
+    rows = []
+    for _, row in result.iterrows():
+        code = str(row["code"]).zfill(6)
+        inst = f"sh{code}" if code.startswith("6") else f"sz{code}"
+
+        d_row = latest_daily[latest_daily["code"] == code]
+        f_row = latest_fin[latest_fin["code"] == code]
+
+        pe_ttm = float(d_row["$pe_ttm"].values[0]) if not d_row.empty and "$pe_ttm" in d_row.columns and pd.notna(d_row["$pe_ttm"].values[0]) else np.nan
+        pb = float(d_row["$pb"].values[0]) if not d_row.empty and "$pb" in d_row.columns and pd.notna(d_row["$pb"].values[0]) else np.nan
+        ps = float(d_row["$ps"].values[0]) if not d_row.empty and "$ps" in d_row.columns and pd.notna(d_row["$ps"].values[0]) else np.nan
+        close = float(d_row["$close"].values[0]) if not d_row.empty and "$close" in d_row.columns and pd.notna(d_row["$close"].values[0]) else np.nan
+
+        def _get_fin(col):
+            if f_row.empty or col not in f_row.columns:
+                return np.nan
+            val = f_row[col].values[0]
+            return float(val) if pd.notna(val) else np.nan
+
+        roe = _get_fin("roe_yearly")
+        npm = _get_fin("netprofit_margin")
+        debt = _get_fin("debt_to_assets")
+        eps_growth = _get_fin("eps_yoy")
+        rev_growth = _get_fin("revenue_yoy")
+        asset_growth = _get_fin("assets_yoy")
+        npta = _get_fin("npta")
+        roa = _get_fin("roa_yearly")
+
+        # Compute financial_score using the same bucket logic
+        def _qb(values, thresholds, reverse=True):
+            """Quick bucket score: 0-100 based on thresholds [(upper,score), ...]"""
+            for upper, score in thresholds:
+                if pd.notna(values) and ((reverse and values >= upper) or (not reverse and values <= upper)):
+                    return float(score)
+            return float(thresholds[-1][1]) if thresholds else 50.0
+
+        def _pct(v):
+            return v * 100 if pd.notna(v) else np.nan
+
+        prof = np.nanmean([_qb(_pct(roe), [(20,100),(15,80),(10,60),(5,40)], reverse=False), 50.0])
+        solv = np.nan if pd.isna(debt) else (100.0 - min(max(debt * 100, 0), 100))
+        oper = np.nan if pd.isna(npm) else min(max(npm * 2, 0), 100)
+        grow = np.nanmean([
+            _qb(_pct(eps_growth), [(30,100),(20,80),(10,60),(0,40)], reverse=False),
+            _qb(_pct(rev_growth), [(20,100),(10,80),(5,60),(0,40)], reverse=False),
+            _qb(_pct(asset_growth), [(20,100),(10,80),(5,60),(0,40)], reverse=False),
+        ]) if any(pd.notna(v) for v in [eps_growth, rev_growth, asset_growth]) else 50.0
+
+        fin_score = float(np.nanmean([prof, solv if pd.notna(solv) else 50.0, oper if pd.notna(oper) else 50.0, grow if pd.notna(grow) else 50.0]))
+        fin_label = _financial_label_from_score(fin_score)
+        val_label = _valuation_label(pe_ttm, pb, ps)
+        industry = industry_lookup.get(code, "未知")
+
+        rows.append({
+            "code": code,
+            "pred_date": pred_date,
+            "date": pred_date,
+            "close": close,
+            "pe_ttm": pe_ttm,
+            "pb": pb,
+            "ps": ps,
+            "industry": industry,
+            "financial_score": fin_score,
+            "financial_label": fin_label,
+            "valuation_label": val_label,
+            "negative_news_count": 0,
+            "is_st": False,
+            "is_suspended": False,
+            "prof_score": prof,
+            "solv_score": solv if pd.notna(solv) else 50.0,
+            "oper_score": oper if pd.notna(oper) else 50.0,
+            "grow_score": grow if pd.notna(grow) else 50.0,
+        })
+
+    out = pd.DataFrame(rows)
+    # Compute cross-sectional valuation score
+    out["valuation_score"] = _cross_sectional_valuation_score(out)
+    out["risk_score"] = _continuous_risk_score(out)
+    # Override labels from continuous scores
+    out["valuation_label"] = np.where(
+        out["valuation_score"] >= 70, "低",
+        np.where(out["valuation_score"] <= 30, "高", "中"),
+    )
+    out["risk_label"] = np.where(
+        out["risk_score"] >= 60, "高",
+        np.where(out["risk_score"] >= 30, "中", "低"),
+    )
+    return out
+
+
 def _build_fallback_result(pool: pd.DataFrame, pred_date: str) -> pd.DataFrame:
     """Build a neutral risk-eval table when baostock is temporarily unavailable."""
     result = pool.copy()
@@ -504,10 +668,11 @@ def risk_eval(input_csv: str, output_dir: str, pred_date: str):
         print(f"✓ 加载初筛结果: {len(pool)} 只股票")
 
         if login_error is not None:
-            result = _build_fallback_result(pool, pred_date)
+            print("  baostock 不可用, 使用 qlib 数据源计算风险评分...")
+            result = _build_qlib_fallback_result(pool, pred_date)
             out_csv = out_path / "risk_eval.csv"
             result.to_csv(out_csv, index=False, encoding="utf-8-sig")
-            print("✓ 已输出 stage4 降级结果（中性财务/估值/风险标签）")
+            print("✓ 已输出 stage4 qlib 数据源风险评分结果")
             print(f"✓ 风险评估保存: {out_csv}")
             return
 

@@ -1,0 +1,4 @@
+tushare==1.2.89
+SQLAlchemy==2.0.29
+pymysql
+fire

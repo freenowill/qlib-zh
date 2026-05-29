@@ -1,0 +1,13 @@
+{
+  "skills": {
+    "factor-mining": {
+      "enabled": true
+    },
+    "train_csi300": {
+      "enabled": true
+    },
+    "train_csi1000": {
+      "enabled": true
+    }
+  }
+}

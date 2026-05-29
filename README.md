@@ -51,7 +51,7 @@ WALK_FORWARD_HISTORY_YEARS=10 WALK_FORWARD_START_DATE=2020-01-01 \
 
 | 目录 | 说明 |
 |------|------|
-| `qlib/` | Qlib 核心库（上游 fork） |
+| `qlib/` | Qlib 核心库（上游 fork，有少量 patch） |
 | `scripts/` | 自定义脚本：数据采集、stage runner、因子构建 |
 | `tushare/` | TuShare 数据管道：API 拉取、健康检查、因子注册 |
 | `rdagent_workspace/` | RDAgent 运行时数据（HDF5、模板） |
@@ -70,6 +70,12 @@ WALK_FORWARD_HISTORY_YEARS=10 WALK_FORWARD_START_DATE=2020-01-01 \
 | `HOLD_NUM` | 持仓数 | `5` |
 | `CASH_TOTAL` | 资金 | `30000` |
 | `WALK_FORWARD_HISTORY_YEARS` | 历史年数 | `9` |
+| `H5_FILE` | HDF5 数据源 | `daily_pv_all.h5` |
+
+## 数据说明
+
+- **qlib 官方数据**（`~/.qlib/qlib_data/cn_data`）仅支持 Alpha158 等标准价量因子
+- **AlphaExtra 及自定义因子**（`run_new_factor_practice`、`/train_csi300`、`/train_csi1000`）需要 TuShare 额外数据支持，通过 `tushare/` 管道生成 H5 特征文件
 
 ## 安全提醒
 

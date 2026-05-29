@@ -14,7 +14,11 @@ import yaml
 
 
 def validate_date_order(dates: dict) -> None:
-    """Ensure train/valid/test windows are strictly ordered and non-overlapping."""
+    """Ensure train/valid/test windows are ordered and non-overlapping.
+
+    train/valid boundaries are strictly ordered; test_start <= test_end is
+    allowed so that a single-day prediction window works in predict_only mode.
+    """
     keys = ["train_start", "train_end", "valid_start", "valid_end", "test_start", "test_end"]
     missing = [k for k in keys if k not in dates]
     if missing:
@@ -22,7 +26,13 @@ def validate_date_order(dates: dict) -> None:
 
     parsed = {k: pd.Timestamp(dates[k]) for k in keys}
     for left, right in zip(keys, keys[1:]):
-        if parsed[left] >= parsed[right]:
+        # Allow test_start == test_end for single-day prediction windows
+        if left == "test_start" and right == "test_end":
+            if parsed[left] > parsed[right]:
+                raise ValueError(
+                    f"Invalid date order: {left}={parsed[left].date()} must not be later than {right}={parsed[right].date()}"
+                )
+        elif parsed[left] >= parsed[right]:
             raise ValueError(
                 f"Invalid date order: {left}={parsed[left].date()} must be earlier than {right}={parsed[right].date()}"
             )
@@ -60,6 +70,7 @@ def patch_yaml(
     model_mode: str = "default",
     data_start: str | None = None,
     sample_weight_half_life: int | None = None,
+    handler_cache: str | None = None,
 ) -> None:
     validate_date_order(dates)
 
@@ -73,6 +84,13 @@ def patch_yaml(
     # ──────────────────────────────────────────
     dh = doc.get("data_handler_config", {})
     handler_start = data_start or dates["train_start"]
+
+    # 从环境变量或参数读取 market (默认 all)
+    _market = os.getenv("TARGET_MARKET", "").strip() or "all"
+    dh["instruments"] = _market
+    if "market" in doc:
+        doc["market"] = _market
+
     # handler 的全局时间范围覆盖训练+验证+测试
     dh["start_time"]     = handler_start
     dh["end_time"]       = dates["test_end"]
@@ -93,11 +111,29 @@ def patch_yaml(
     hkw = doc["task"]["dataset"]["kwargs"]["handler"]
     if isinstance(hkw, dict) and "kwargs" in hkw:
         hkw["kwargs"].update(
+            instruments=_market,
             start_time=handler_start,
             end_time=dates["test_end"],
             fit_start_time=dates["train_start"],
             fit_end_time=dates["train_end"],
         )
+
+    # ──────────────────────────────────────────
+    # 2b. 可选: 替换 handler 为缓存版本
+    #     Alpha158 → CachedAlpha158
+    #     AlphaExtra → CachedAlphaExtra
+    # ──────────────────────────────────────────
+    if handler_cache:
+        hkw = doc["task"]["dataset"]["kwargs"]["handler"]
+        orig_class = hkw.get("class", "")
+        cache_class = {
+            "Alpha158": "CachedAlpha158",
+            "AlphaExtra": "CachedAlphaExtra",
+        }.get(orig_class)
+        if cache_class:
+            hkw["class"] = cache_class
+            hkw["module_path"] = "scripts.small.cached_handler"
+            hkw["kwargs"]["cache_path"] = handler_cache
 
     # ──────────────────────────────────────────
     # 3. 更新 port_analysis_config backtest 时间
@@ -121,7 +157,30 @@ def patch_yaml(
     bt["account"] = cash_total
 
     # ──────────────────────────────────────────
-    # 4. 写出
+    # 4a. 更新 benchmark: 优先使用 TARGET_BENCHMARK 环境变量
+    # ──────────────────────────────────────────
+    _target_benchmark = os.getenv("TARGET_BENCHMARK", "").strip()
+    if _target_benchmark:
+        # 更新顶层 benchmark
+        doc["benchmark"] = _target_benchmark
+        # 更新 port_analysis_config 中的 benchmark
+        _pa = doc.get("port_analysis_config", {})
+        if _pa and "backtest" in _pa and isinstance(_pa["backtest"], dict):
+            _pa["backtest"]["benchmark"] = _target_benchmark
+
+    # ──────────────────────────────────────────
+    # 4b. 移除 PortAnaRecord (cn_extra_data 无 benchmark 数据)
+    #     walk-forward full backtest 已负责性能评估
+    # ──────────────────────────────────────────
+    records = doc.get("task", {}).get("record", [])
+    if isinstance(records, list):
+        doc["task"]["record"] = [
+            r for r in records
+            if not (isinstance(r, dict) and r.get("class") == "PortAnaRecord")
+        ]
+
+    # ──────────────────────────────────────────
+    # 5. 写出
     # ──────────────────────────────────────────
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
@@ -146,6 +205,7 @@ def main():
     ap.add_argument("--model-mode", choices=["default", "robust"], default="default", dest="model_mode")
     ap.add_argument("--data-start", default=None, dest="data_start")
     ap.add_argument("--sample-weight-half-life", type=int, default=None, dest="sample_weight_half_life")
+    ap.add_argument("--handler-cache", default=None, dest="handler_cache")
     args = ap.parse_args()
 
     sample_weight_half_life = args.sample_weight_half_life
@@ -170,6 +230,7 @@ def main():
         model_mode=args.model_mode,
         data_start=getattr(args, "data_start", None),
         sample_weight_half_life=sample_weight_half_life,
+        handler_cache=getattr(args, "handler_cache", None),
     )
 
 

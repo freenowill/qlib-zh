@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
 # run_alpha158_practice — 周度实盘选股辅助脚本
-# 用法: bash run_alpha158_practice <experiment_name> [stage=N] [end_stage=N]
+# 用法: bash run_alpha158_practice <experiment_name> [stage=N] [end_stage=N] [predict_only=True]
 # 示例: bash run_alpha158_practice myexp_20260401 stage=0 end_stage=6
 #       bash run_alpha158_practice myexp_20260401 stage=2  # 仅执行 stage2
+#       bash run_alpha158_practice myexp_20260401 stage=2 end_stage=2 predict_only=True  # 仅预测
 # =============================================================================
 set -euo pipefail
 
@@ -21,14 +22,22 @@ shift
 
 START_STAGE=1
 END_STAGE=6
+PREDICT_ONLY=""
+PRED_DATE_OVERRIDE=""
+LAST_N_DAYS=1
 
 for arg in "$@"; do
   case "$arg" in
-    stage=*)     START_STAGE="${arg#stage=}" ;;
-    end_stage=*) END_STAGE="${arg#end_stage=}" ;;
+    stage=*)          START_STAGE="${arg#stage=}" ;;
+    end_stage=*)      END_STAGE="${arg#end_stage=}" ;;
+    predict_only=*)   PREDICT_ONLY="${arg#predict_only=}" ;;
+    pred_date=*)      PRED_DATE_OVERRIDE="${arg#pred_date=}" ;;
+    last_n_days=*)    LAST_N_DAYS="${arg#last_n_days=}" ;;
     *) echo "Unknown argument: $arg" >&2; exit 1 ;;
   esac
 done
+
+export PREDICT_ONLY
 
 # ──────────────────────────────────────────────
 # 1. 全局路径 / 常量
@@ -209,6 +218,15 @@ echo "  分段(年)   : $WALK_FORWARD_SEGMENT_YEARS"
 echo "  full bt    : $FULL_BACKTEST_STRATEGY"
 echo "  卖出缓冲   : top ${FULL_BACKTEST_BUFFER_PCT_INT}% 保留"
 echo "  stage      : $START_STAGE → $END_STAGE"
+if [[ -n "$PREDICT_ONLY" ]]; then
+  echo "  predict_only: $PREDICT_ONLY"
+fi
+if [[ -n "$PRED_DATE_OVERRIDE" ]]; then
+  echo "  pred_date  : $PRED_DATE_OVERRIDE"
+fi
+if [[ "$LAST_N_DAYS" -gt 1 ]]; then
+  echo "  last_n_days: $LAST_N_DAYS"
+fi
 echo "  output     : $OUT_DIR"
 echo "============================================================"
 
@@ -254,11 +272,21 @@ run_stage1() {
 }
 
 run_stage2() {
+  local _pred_date_override="${1:-}"  # 可选：指定预测日期
   echo ""
-  echo "╔══════════════════════════════════════════╗"
-  echo "║  STAGE 2 — Walk-forward 训练与预测     ║"
-  echo "╚══════════════════════════════════════════╝"
+  if [[ "$PREDICT_ONLY" == "True" || "$PREDICT_ONLY" == "true" ]]; then
+    echo "╔══════════════════════════════════════════╗"
+    echo "║  STAGE 2 — Predict Only (不训练)        ║"
+    echo "╚══════════════════════════════════════════╝"
+  else
+    echo "╔══════════════════════════════════════════╗"
+    echo "║  STAGE 2 — Walk-forward 训练与预测     ║"
+    echo "╚══════════════════════════════════════════╝"
+  fi
   local log="$LOG_DIR/stage2.log"
+  if [[ -n "$_pred_date_override" ]]; then
+    log="$LOG_DIR/stage2_${_pred_date_override}.log"
+  fi
 
   (
     set -euo pipefail
@@ -266,6 +294,17 @@ run_stage2() {
     local YAML_SRC="$WORKFLOW_TEMPLATE"
     local PRED_OUT_HOST="$OUT_DIR/model_predict"
     local PRED_OUT_CONTAINER="$OUT_DIR_IN_CONTAINER/model_predict"
+    local PREDICT_ONLY_FLAG=""
+    if [[ "$PREDICT_ONLY" == "True" || "$PREDICT_ONLY" == "true" ]]; then
+      PREDICT_ONLY_FLAG="--predict-only"
+    fi
+
+    local PRED_DATE_FLAG=""
+    local _wf_end="$WALK_FORWARD_END_DATE"
+    if [[ -n "$_pred_date_override" ]]; then
+      PRED_DATE_FLAG="--pred-date $_pred_date_override"
+      _wf_end="$_pred_date_override"
+    fi
 
     echo "[1/3] 启动 Docker 容器并运行 walk-forward stage2"
     docker run --rm \
@@ -288,7 +327,7 @@ run_stage2() {
       -e WALK_FORWARD_HISTORY_YEARS \
       -e WALK_FORWARD_SEGMENT_YEARS \
       -e WALK_FORWARD_START_DATE \
-      -e WALK_FORWARD_END_DATE \
+      -e WALK_FORWARD_END_DATE="$_wf_end" \
       -e FULL_BACKTEST_STRATEGY \
       -e FULL_BACKTEST_BUFFER_PCT \
       -v "$SCRIPT_DIR:$WORKDIR_IN_CONTAINER" \
@@ -313,16 +352,22 @@ run_stage2() {
       --segment-years "$WALK_FORWARD_SEGMENT_YEARS" \
       --train-base-start "$TRAIN_BASE_START" \
       --walk-forward-start "$WALK_FORWARD_START_DATE" \
-      --walk-forward-end "$WALK_FORWARD_END_DATE" \
+      --walk-forward-end "$_wf_end" \
       --hold-num "$HOLD_NUM" \
-      --model-mode robust
+      --model-mode robust \
+      $PREDICT_ONLY_FLAG \
+      $PRED_DATE_FLAG
 
     echo "[2/3] 读取 walk-forward 汇总"
     if [[ -f "$PRED_OUT_HOST/walk_forward_summary.csv" ]]; then
       head -20 "$PRED_OUT_HOST/walk_forward_summary.csv"
     fi
 
-    echo "[3/3] Stage2 完成 — 最新折叠结果保存在: $PRED_OUT_HOST"
+    if [[ "$PREDICT_ONLY" == "True" || "$PREDICT_ONLY" == "true" ]]; then
+      echo "[3/3] Stage2 predict_only 完成 — 预测结果保存在: $PRED_OUT_HOST"
+    else
+      echo "[3/3] Stage2 完成 — 最新折叠结果保存在: $PRED_OUT_HOST"
+    fi
   ) 2>&1 | tee "$log"
 }
 
@@ -442,17 +487,57 @@ run_stage6() {
 # ──────────────────────────────────────────────
 # 执行调度
 # ──────────────────────────────────────────────
-for stage in $(seq "$START_STAGE" "$END_STAGE"); do
-  case "$stage" in
-    1) run_stage1 ;;
-    2) run_stage2 ;;
-    3) run_stage3 ;;
-    4) run_stage4 ;;
-    5) run_stage5 ;;
-    6) run_stage6 ;;
-    *) echo "Ignoring stage: $stage" >&2;;
-  esac
-done
+
+# 获取最近 N 个交易日（从日历文件倒数）
+get_last_n_trade_dates() {
+  local n="$1"
+  tail -"$n" "$DATA_CALENDAR_FILE" | tr -d '\r'
+}
+
+# predict_only 多日批量模式
+if [[ "$LAST_N_DAYS" -gt 1 && ("$PREDICT_ONLY" == "True" || "$PREDICT_ONLY" == "true") && "$START_STAGE" -eq 2 && "$END_STAGE" -eq 2 ]]; then
+  SCORES_DIR="$OUT_DIR/predict_scores"
+  mkdir -p "$SCORES_DIR"
+  echo ""
+  echo "============================================================"
+  echo "  批量预测最近 ${LAST_N_DAYS} 个交易日"
+  echo "  输出目录: $SCORES_DIR"
+  echo "============================================================"
+
+  for pred_date in $(get_last_n_trade_dates "$LAST_N_DAYS"); do
+    echo ""
+    echo ">>>>> 预测日期: $pred_date"
+    run_stage2 "$pred_date"
+    # 从 predict_only 子目录拷贝 scores.csv 并以日期命名
+    local_scores="$OUT_DIR/model_predict/walk_forward/predict_only_${pred_date//-/}/model_predict/scores.csv"
+    if [[ -f "$local_scores" ]]; then
+      cp "$local_scores" "$SCORES_DIR/${pred_date}.csv"
+      echo "✓ 已保存: $SCORES_DIR/${pred_date}.csv"
+    else
+      echo "⚠ 未找到 scores.csv: $local_scores" >&2
+    fi
+  done
+
+  echo ""
+  echo "============================================================"
+  echo "  批量预测完成 — 结果在: $SCORES_DIR"
+  echo "============================================================"
+  ls -la "$SCORES_DIR/"
+
+else
+  # 常规单次执行
+  for stage in $(seq "$START_STAGE" "$END_STAGE"); do
+    case "$stage" in
+      1) run_stage1 ;;
+      2) run_stage2 "$PRED_DATE_OVERRIDE" ;;
+      3) run_stage3 ;;
+      4) run_stage4 ;;
+      5) run_stage5 ;;
+      6) run_stage6 ;;
+      *) echo "Ignoring stage: $stage" >&2;;
+    esac
+  done
+fi
 
 echo ""
 echo "============================================================"
