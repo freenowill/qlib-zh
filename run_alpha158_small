@@ -2,9 +2,10 @@
 # =============================================================================
 # run_alpha158_small — 周度实盘选股辅助脚本（中证1000 / 小盘风格）
 # 用法: bash run_alpha158_small <experiment_name> [stage=N] [end_stage=N] [lightgbm_only=1]
-# 示例: bash run_alpha158_small myexp_20260421 stage=1 end_stage=6
-#       STAGE2_MAX_FOLDS=1 bash run_alpha158_small myexp_20260421 stage=2 end_stage=6
-#       bash run_alpha158_small myexp_20260421 lightgbm_only=1  # 仅用 LightGBM 单模型（跳过 XGBoost 和 Ensemble）
+# 示例: bash run_alpha158_small myexp_20260421 stage=0 end_stage=3
+#       STAGE2_MAX_FOLDS=1 bash run_alpha158_small myexp_20260421 stage=2 end_stage=3
+#       bash run_alpha158_small myexp_20260421 lightgbm_only=1
+# Stage0: 数据健康  Stage1: 预计算特征缓存  Stage2: walk-forward 训练  Stage3: 实盘选股
 # =============================================================================
 set -euo pipefail
 
@@ -13,14 +14,15 @@ set -euo pipefail
 # ──────────────────────────────────────────────
 if [[ $# -lt 1 ]]; then
 	echo "Usage: bash run_alpha158_small <experiment_name> [stage=N] [end_stage=N]" >&2
-	echo "       N: 1-6 (default start=1  end=6)" >&2
+	echo "       N: 0-6 (default start=0  end=6)" >&2
+	echo "       Stage0: 数据健康  Stage1: 缓存预计算  Stage2: 训练  Stage3: 实盘选股" >&2
 	exit 1
 fi
 
 EXP_NAME="$1"
 shift
 
-START_STAGE=1
+START_STAGE=0
 END_STAGE=6
 
 LIGHTGBM_ONLY=0
@@ -191,12 +193,12 @@ echo "  stage      : $START_STAGE → $END_STAGE"
 echo "  output     : $OUT_DIR"
 echo "============================================================"
 
-run_stage1() {
+run_stage0() {
 	echo ""
 	echo "╔══════════════════════════════════════════╗"
-	echo "║  STAGE 1 — 数据准备 / 健康检查          ║"
+	echo "║  STAGE 0 — 数据准备 / 健康检查          ║"
 	echo "╚══════════════════════════════════════════╝"
-	local log="$LOG_DIR/stage1.log"
+	local log="$LOG_DIR/stage0.log"
 
 	(
 		set -euo pipefail
@@ -224,7 +226,76 @@ run_stage1() {
 			--pred-date "$PRED_DATE" \
 			--market "$TARGET_MARKET"
 
-		echo "✓ Stage1 完成 — 中证1000数据健康检查通过"
+		echo "✓ Stage0 完成 — 中证1000数据健康检查通过"
+	) 2>&1 | tee "$log"
+}
+
+run_stage1() {
+	echo ""
+	echo "╔══════════════════════════════════════════╗"
+	echo "║  STAGE 1 — 预计算特征缓存 (4 workers)   ║"
+	echo "╚══════════════════════════════════════════╝"
+	local log="$LOG_DIR/stage1.log"
+
+	(
+		set -euo pipefail
+
+		local YAML_SRC="$WORKFLOW_TEMPLATE"
+		local PRED_OUT_HOST="$OUT_DIR/model_predict"
+		local PRED_OUT_CONTAINER="$OUT_DIR_IN_CONTAINER/model_predict"
+		local _wf_end="$WALK_FORWARD_END_DATE"
+
+		echo "[1/1] 并行预计算 Alpha158 全量特征缓存 (workers=4)"
+		docker run --rm \
+			-e CASH_TOTAL \
+			-e HOLD_NUM \
+			-e TX_FEE_RATE \
+			-e STAMP_DUTY_RATE \
+			-e FULL_BACKTEST_STRATEGY \
+			-e FULL_BACKTEST_BUFFER_PCT \
+			-e FULL_BACKTEST_REPLAY_YEARS \
+			-e GM_TOKEN \
+			-e TARGET_MARKET \
+			-e QLIB_DATA_DIR=/root/.qlib/qlib_data/cn_data_filter_small \
+			-e STAGE2_MAX_FOLDS \
+			-e STAGE2_LIGHTGBM_ONLY \
+			-e WALK_FORWARD_STEP_YEARS \
+			-e WALK_FORWARD_STEP_WEEKS \
+			-e WALK_FORWARD_TEST_YEARS \
+			-e WALK_FORWARD_TEST_WEEKS \
+			-e WALK_FORWARD_HISTORY_YEARS \
+			-e WALK_FORWARD_SEGMENT_YEARS \
+			-e WALK_FORWARD_START_DATE \
+			-e WALK_FORWARD_END_DATE="$_wf_end" \
+			-v "$SCRIPT_DIR:$WORKDIR_IN_CONTAINER" \
+			-v "$QDATA_HOST_DIR:/root/.qlib" \
+			-w "$WORKDIR_IN_CONTAINER" \
+			"$DOCKER_IMAGE" \
+			python3 scripts/small/run_stage2_walk_forward_small.py \
+			--template "$YAML_SRC" \
+			--output-root "$PRED_OUT_CONTAINER" \
+			--analysis-root "$WORKDIR_IN_CONTAINER/DATA/analysis_outputs/$EXP_NAME" \
+			--experiment-name "$EXP_NAME" \
+			--uri-folder mlruns \
+			--half-life "$SAMPLE_WEIGHT_HALF_LIFE" \
+			--floor 0.2 \
+			--step-years "$WALK_FORWARD_STEP_YEARS" \
+			--step-weeks "$WALK_FORWARD_STEP_WEEKS" \
+			--test-years "$WALK_FORWARD_TEST_YEARS" \
+			--test-weeks "$WALK_FORWARD_TEST_WEEKS" \
+			--history-years "$WALK_FORWARD_HISTORY_YEARS" \
+			--train-years "$TRAIN_YEARS" \
+			--valid-years "$VALID_YEARS" \
+			--segment-years "$WALK_FORWARD_SEGMENT_YEARS" \
+			--train-base-start "$TRAIN_BASE_START" \
+			--walk-forward-start "$WALK_FORWARD_START_DATE" \
+			--walk-forward-end "$_wf_end" \
+			--hold-num "$HOLD_NUM" \
+			--model-mode robust \
+			--cache-only \
+			--cache-workers 4
+
+		echo "✓ Stage1 完成 — 特征缓存已生成"
 	) 2>&1 | tee "$log"
 }
 
@@ -336,6 +407,7 @@ run_stage3_live() {
 
 for stage in $(seq "$START_STAGE" "$END_STAGE"); do
 	case "$stage" in
+		0) run_stage0 ;;
 		1) run_stage1 ;;
 		2) run_stage2 ;;
 		3) run_stage3_live ;;
