@@ -82,7 +82,7 @@ def _build_smallcap_qlib_dir(source_dir: Path, target_dir: Path, market: str) ->
     return meta
 
 
-def _run_health_check(qlib_dir: Path) -> None:
+def _run_health_check(qlib_dir: Path, market: str = "all") -> None:
     script_path = Path(__file__).resolve().parents[1] / "check_data_health.py"
     cmd = [
         sys.executable,
@@ -90,6 +90,8 @@ def _run_health_check(qlib_dir: Path) -> None:
         "check_data",
         "--qlib_dir",
         str(qlib_dir),
+        "--market",
+        market,
     ]
     subprocess.run(cmd, check=True)
 
@@ -115,7 +117,7 @@ def main() -> None:
         raise SystemExit(f"缺少必要数据路径: {missing_paths}")
 
     latest_date = _latest_calendar_date(qlib_dir)
-    _run_health_check(qlib_dir)
+    _run_health_check(qlib_dir, args.market)
 
     summary = {
         "source_qlib_dir": str(source_dir),

@@ -26,6 +26,7 @@ class DataHealthChecker:
         large_step_threshold_price=0.5,
         large_step_threshold_volume=3,
         missing_data_num=0,
+        market="all",
     ):
         assert csv_path or qlib_dir, "One of csv_path or qlib_dir should be provided."
         assert not (csv_path and qlib_dir), "Only one of csv_path or qlib_dir should be provided."
@@ -36,6 +37,7 @@ class DataHealthChecker:
         self.large_step_threshold_price = large_step_threshold_price
         self.large_step_threshold_volume = large_step_threshold_volume
         self.missing_data_num = missing_data_num
+        self.market = market
         self.qlib_dir = os.path.abspath(os.path.expanduser(qlib_dir))
 
         if csv_path:
@@ -50,7 +52,7 @@ class DataHealthChecker:
             self.load_qlib_data()
 
     def load_qlib_data(self):
-        instruments = D.instruments(market="all")
+        instruments = D.instruments(market=self.market)
         instrument_list = D.list_instruments(instruments=instruments, as_list=True, freq=self.freq)
         required_fields = ["$open", "$close", "$low", "$high", "$volume", "$factor"]
         for instrument in instrument_list:
