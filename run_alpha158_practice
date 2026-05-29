@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
 # run_alpha158_practice — 周度实盘选股辅助脚本
-# 用法: bash run_alpha158_practice <experiment_name> [stage=N] [end_stage=N] [predict_only=True]
+# 用法: bash run_alpha158_practice <experiment_name> [stage=N] [end_stage=N] [predict_only=True] [lightgbm_only=1]
 # 示例: bash run_alpha158_practice myexp_20260401 stage=0 end_stage=2
 #       bash run_alpha158_practice myexp_20260401 stage=2  # 仅执行 stage2
 #       bash run_alpha158_practice myexp_20260401 stage=2 end_stage=2 predict_only=True  # 仅预测
+#       bash run_alpha158_practice myexp_20260401 lightgbm_only=1  # 仅训练 LightGBM
 # Stage0: 数据健康检查  Stage1: 并行预计算特征缓存  Stage2: walk-forward 训练+回测
 # =============================================================================
 set -euo pipefail
@@ -27,6 +28,7 @@ END_STAGE=6
 PREDICT_ONLY=""
 PRED_DATE_OVERRIDE=""
 LAST_N_DAYS=1
+LIGHTGBM_ONLY=0
 
 for arg in "$@"; do
   case "$arg" in
@@ -35,11 +37,38 @@ for arg in "$@"; do
     predict_only=*)   PREDICT_ONLY="${arg#predict_only=}" ;;
     pred_date=*)      PRED_DATE_OVERRIDE="${arg#pred_date=}" ;;
     last_n_days=*)    LAST_N_DAYS="${arg#last_n_days=}" ;;
+    lightgbm_only=*)  LIGHTGBM_ONLY="${arg#lightgbm_only=}" ;;
     *) echo "Unknown argument: $arg" >&2; exit 1 ;;
   esac
 done
 
 export PREDICT_ONLY
+export STAGE2_LIGHTGBM_ONLY="${LIGHTGBM_ONLY:-0}"
+
+# ──────────────────────────────────────────────
+# 1a. DEBUG 模式（10只股票快速调试）
+# ──────────────────────────────────────────────
+if [[ "${DEBUG:-0}" == "1" ]]; then
+    echo "[DEBUG] 模式已启用 — 10只股票 + 短日期，快速验证代码流程"
+    TARGET_MARKET="${TARGET_MARKET:-debug_stocks}"
+    TRAIN_YEARS=1
+    VALID_YEARS=1
+    WALK_FORWARD_TEST_YEARS=1
+    WALK_FORWARD_STEP_YEARS=1
+    WALK_FORWARD_HISTORY_YEARS=3
+    WALK_FORWARD_START_DATE=2023-01-01
+    export DEBUG=1
+fi
+
+# 确保 debug 用的 instrument 文件在源和目标数据目录中都存在
+_setup_debug_instruments() {
+    local src_dir="$QDATA_HOST_DIR/qlib_data/cn_data/instruments"
+    local dst_dir="$QDATA_HOST_DIR/qlib_data/cn_data_filter/instruments"
+    mkdir -p "$src_dir" "$dst_dir"
+    cp "$SCRIPT_DIR/scripts/small/debug_stocks.txt" "$src_dir/debug_stocks.txt"
+    cp "$SCRIPT_DIR/scripts/small/debug_stocks.txt" "$dst_dir/debug_stocks.txt"
+    echo "[DEBUG] instrument 文件已复制到: $src_dir 和 $dst_dir"
+}
 
 # ──────────────────────────────────────────────
 # 1. 全局路径 / 常量
@@ -276,7 +305,7 @@ run_stage0() {
 run_stage1() {
   echo ""
   echo "╔══════════════════════════════════════════╗"
-  echo "║  STAGE 1 — 预计算特征缓存 (4 workers)   ║"
+  echo "║  STAGE 1 — 预计算特征缓存 (workers: ${CACHE_WORKERS:-4}) ║"
   echo "╚══════════════════════════════════════════╝"
   local log="$LOG_DIR/stage1.log"
 
@@ -288,12 +317,13 @@ run_stage1() {
     local PRED_OUT_CONTAINER="$OUT_DIR_IN_CONTAINER/model_predict"
     local _wf_end="$WALK_FORWARD_END_DATE"
 
-    echo "[1/1] 并行预计算 Alpha158 全量特征缓存 (workers=4)"
+	    echo "[1/1] 并行预计算 Alpha158 全量特征缓存 (workers=${CACHE_WORKERS:-4})"
     docker run --rm \
       -e CASH_TOTAL \
       -e HOLD_NUM \
       -e TX_FEE_RATE \
       -e STAMP_DUTY_RATE \
+      -e STAGE2_LIGHTGBM_ONLY \
       -e TARGET_MARKET \
       -e WALK_FORWARD_STEP_YEARS \
       -e WALK_FORWARD_STEP_WEEKS \
@@ -331,7 +361,7 @@ run_stage1() {
       --hold-num "$HOLD_NUM" \
       --model-mode robust \
       --cache-only \
-      --cache-workers 4
+      --cache-workers "${CACHE_WORKERS:-4}"
 
     echo "✓ Stage1 完成 — 特征缓存已生成"
   ) 2>&1 | tee "$log"
@@ -378,6 +408,7 @@ run_stage2() {
       -e HOLD_NUM \
       -e TX_FEE_RATE \
       -e STAMP_DUTY_RATE \
+      -e STAGE2_LIGHTGBM_ONLY \
       -e GM_TOKEN \
       -e TCN_NUM_WORKERS \
       -e TCN_BATCH_SIZE \
@@ -553,6 +584,11 @@ run_stage6() {
 # ──────────────────────────────────────────────
 # 执行调度
 # ──────────────────────────────────────────────
+
+# DEBUG 模式：在 Stage0 前将 debug instrument 注入源 & 目标目录
+if [[ "${DEBUG:-0}" == "1" ]]; then
+    _setup_debug_instruments
+fi
 
 # 获取最近 N 个交易日（从日历文件倒数）
 get_last_n_trade_dates() {

@@ -57,6 +57,10 @@ except ImportError:
 
 
 ROOT = Path(__file__).resolve().parents[2]
+# Ensure repo root is on sys.path so `from scripts.small.cached_handler import ...`
+# works both when called directly (run_alpha158_practice) and via importlib (run_alpha158_small).
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 SCRIPTS = ROOT / "scripts" / "practice"
 WARM_START_STRATEGY = "previous_fold_checkpoint_v1"
 MODEL_SPECS = [
@@ -71,6 +75,12 @@ MODEL_SPECS = [
         "model_mode": "robust",
     },
 ]
+
+# Allow lightgbm_only mode via env var (skips XGBoost training for faster runs)
+if str(os.environ.get("STAGE2_LIGHTGBM_ONLY", "0")).strip() in ("1", "true", "yes"):
+    MODEL_SPECS = [s for s in MODEL_SPECS if s["name"] == "lightgbm"]
+    if not MODEL_SPECS:
+        raise RuntimeError("STAGE2_LIGHTGBM_ONLY is set but no lightgbm model found in MODEL_SPECS")
 
 
 def _target_route_model_names() -> list[str]:
@@ -880,7 +890,14 @@ def _precompute_handler_cache(
     except KeyError:
         raise RuntimeError("Cannot find handler config in template")
 
+    # Override instruments from TARGET_MARKET env var (respects DEBUG / custom markets)
+    target_market = _os.environ.get("TARGET_MARKET", "")
+    if target_market:
+        handler_cfg = copy.deepcopy(handler_cfg)
+        handler_cfg.setdefault("kwargs", {})["instruments"] = target_market
+
     if workers > 1:
+        from scripts.small.cached_handler import _precompute_handler_cache_parallel
         _precompute_handler_cache_parallel(
             cache_path, template_cfg, handler_cfg,
             start_time, end_time, provider_uri, workers,
@@ -888,6 +905,7 @@ def _precompute_handler_cache(
         return
 
     # ── Serial path (original) ──────────────────────────────────
+    from scripts.small.cached_handler import _dump_cached_data
     handler_cfg = copy.deepcopy(handler_cfg)
     handler_cfg["kwargs"]["start_time"] = start_time
     handler_cfg["kwargs"]["end_time"] = end_time
@@ -907,130 +925,7 @@ def _precompute_handler_cache(
     print(f"  [Cache] Saved {n_rows} rows ({n_dates} dates × {n_inst} inst) → {cache_path}")
 
 
-def _precompute_worker(
-    provider_uri: str,
-    handler_cfg: dict,
-    instruments: list[str],
-    start_time: str,
-    end_time: str,
-    chunk_id: int,
-) -> "pd.DataFrame":
-    """Worker process: compute Alpha158 features for one chunk of instruments."""
-    import copy
-    import os
-    import qlib
-    from pathlib import Path as _Path
-    from qlib.data.dataset.handler import DataHandlerLP
-    from qlib.utils import init_instance_by_config
 
-    qlib.init(provider_uri=provider_uri)
-
-    # Write temp instrument file for this chunk
-    prov_path = _Path(provider_uri)
-    inst_dir = prov_path / "instruments"
-    inst_dir.mkdir(parents=True, exist_ok=True)
-    chunk_name = f"_cache_chunk_{os.getpid()}_{chunk_id}"
-    chunk_file = inst_dir / f"{chunk_name}.txt"
-    with open(chunk_file, "w") as f:
-        for code in instruments:
-            f.write(f"{code}\t{start_time}\t{end_time}\n")
-
-    try:
-        cfg = copy.deepcopy(handler_cfg)
-        kw = cfg.setdefault("kwargs", {})
-        kw["start_time"] = start_time
-        kw["end_time"] = end_time
-        kw["fit_start_time"] = start_time
-        kw["fit_end_time"] = end_time
-        kw["instruments"] = chunk_name
-
-        handler = init_instance_by_config(cfg)
-        handler.setup_data(DataHandlerLP.IT_FIT_SEQ)
-
-        df = handler._data.copy()
-        print(f"  [Worker {chunk_id}] {len(df)} rows ({len(instruments)} instruments)", flush=True)
-        return df
-    finally:
-        if chunk_file.exists():
-            chunk_file.unlink()
-
-
-def _precompute_handler_cache_parallel(
-    cache_path: str,
-    template_cfg: dict,
-    handler_cfg: dict,
-    start_time: str,
-    end_time: str,
-    provider_uri: str,
-    workers: int,
-) -> None:
-    """Split instruments across ``workers`` subprocesses, compute features, combine."""
-    import copy
-    import json
-    import os as _os
-    from concurrent.futures import ProcessPoolExecutor
-    from pathlib import Path as _Path
-
-    import pandas as pd
-
-    from qlib.data import D
-
-    # Resolve the full instrument list from the template's market setting
-    inst_setting = handler_cfg.get("kwargs", {}).get("instruments", "all")
-    if isinstance(inst_setting, str):
-        instruments = D.list_instruments(D.instruments(market=inst_setting), freq="day", as_list=True)
-    else:
-        instruments = D.list_instruments(D.instruments(market="all"), freq="day", as_list=True)
-
-    if not instruments:
-        raise RuntimeError("No instruments found — cannot precompute cache")
-
-    # Split into chunks
-    chunk_size = max(1, (len(instruments) + workers - 1) // workers)
-    chunks = [instruments[i:i + chunk_size] for i in range(0, len(instruments), chunk_size)]
-    chunks = [c for c in chunks if c]  # drop empties
-
-    print(f"  [Cache] Parallel precompute: {len(instruments)} instruments → "
-          f"{len(chunks)} chunks × {workers} workers")
-
-    # Snapshot handler_cfg for pickling (strip non-picklable values just in case)
-    worker_cfg = copy.deepcopy(handler_cfg)
-
-    with ProcessPoolExecutor(max_workers=min(workers, len(chunks))) as ex:
-        futures = [
-            ex.submit(_precompute_worker, provider_uri, worker_cfg, chunk,
-                       start_time, end_time, i)
-            for i, chunk in enumerate(chunks)
-        ]
-        results = [f.result() for f in futures]
-
-    combined = pd.concat(results, axis=0)
-    n_rows = len(combined)
-    n_dates = combined.index.get_level_values("datetime").nunique()
-    n_inst = combined.index.get_level_values("instrument").nunique()
-    print(f"  [Cache] Combined: {n_rows} rows ({n_dates} dates × {n_inst} inst)")
-
-    _dump_cached_data(combined, cache_path)
-    print(f"  [Cache] Saved → {cache_path}")
-
-
-def _dump_cached_data(df, path):
-    """Save a MultiIndex (datetime, instrument) DataFrame to disk (pickle).
-
-    Pickle is used instead of parquet for reliability with wide DataFrames
-    (200+ features × thousands of dates/stocks).  Parquet+zstd was found to
-    hang on large AlphaExtra datasets due to memory pressure.  The meta.json
-    file is written by the caller after this returns.
-    """
-    import os
-    path = str(path)
-    n_rows = len(df)
-    print(f"  [Cache] Saving {n_rows} rows to {os.path.basename(path)} ...", flush=True)
-    df_to_save = df.reset_index()
-    if isinstance(df_to_save.columns, pd.MultiIndex):
-        df_to_save.columns = [str(col) for col in df_to_save.columns]
-    df_to_save.to_pickle(path)
-    print(f"  [Cache] Pickle save done ({os.path.basename(path)})", flush=True)
 
 def _train_single_model_fold(
     spec: dict[str, object],

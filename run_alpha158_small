@@ -36,6 +36,32 @@ for arg in "$@"; do
 done
 
 # ──────────────────────────────────────────────
+# 1a. DEBUG 模式（10只股票快速调试）
+# ──────────────────────────────────────────────
+if [[ "${DEBUG:-0}" == "1" ]]; then
+    echo "[DEBUG] 模式已启用 — 5只股票 + 短日期，快速验证代码流程"
+    TARGET_MARKET="${TARGET_MARKET:-debug_stocks}"
+    TRAIN_YEARS=1
+    VALID_YEARS=1
+    WALK_FORWARD_TEST_YEARS=1
+    WALK_FORWARD_STEP_YEARS=1
+    WALK_FORWARD_HISTORY_YEARS=3
+    WALK_FORWARD_START_DATE=2023-01-01
+    STAGE2_MAX_FOLDS="${STAGE2_MAX_FOLDS:-1}"
+    export DEBUG=1
+fi
+
+# 确保 debug 用的 instrument 文件在源和目标数据目录中都存在
+_setup_debug_instruments() {
+    local src_dir="$QDATA_HOST_DIR/qlib_data/cn_data/instruments"
+    local dst_dir="$QDATA_HOST_DIR/qlib_data/cn_data_filter_small/instruments"
+    mkdir -p "$src_dir" "$dst_dir"
+    cp "$SCRIPT_DIR/scripts/small/debug_stocks.txt" "$src_dir/debug_stocks.txt"
+    cp "$SCRIPT_DIR/scripts/small/debug_stocks.txt" "$dst_dir/debug_stocks.txt"
+    echo "[DEBUG] instrument 文件已复制到: $src_dir 和 $dst_dir"
+}
+
+# ──────────────────────────────────────────────
 # 1. 全局路径 / 常量
 # ──────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -230,10 +256,15 @@ run_stage0() {
 	) 2>&1 | tee "$log"
 }
 
+# DEBUG 模式：在 Stage0 前将 debug instrument 注入源 & 目标目录
+if [[ "${DEBUG:-0}" == "1" ]]; then
+    _setup_debug_instruments
+fi
+
 run_stage1() {
 	echo ""
 	echo "╔══════════════════════════════════════════╗"
-	echo "║  STAGE 1 — 预计算特征缓存 (4 workers)   ║"
+	echo "║  STAGE 1 — 预计算特征缓存 (workers: ${CACHE_WORKERS:-4}) ║"
 	echo "╚══════════════════════════════════════════╝"
 	local log="$LOG_DIR/stage1.log"
 
@@ -245,7 +276,7 @@ run_stage1() {
 		local PRED_OUT_CONTAINER="$OUT_DIR_IN_CONTAINER/model_predict"
 		local _wf_end="$WALK_FORWARD_END_DATE"
 
-		echo "[1/1] 并行预计算 Alpha158 全量特征缓存 (workers=4)"
+		echo "[1/1] 并行预计算 Alpha158 全量特征缓存 (workers=${CACHE_WORKERS:-4})"
 		docker run --rm \
 			-e CASH_TOTAL \
 			-e HOLD_NUM \
@@ -293,7 +324,7 @@ run_stage1() {
 			--hold-num "$HOLD_NUM" \
 			--model-mode robust \
 			--cache-only \
-			--cache-workers 4
+			--cache-workers "${CACHE_WORKERS:-4}"
 
 		echo "✓ Stage1 完成 — 特征缓存已生成"
 	) 2>&1 | tee "$log"
