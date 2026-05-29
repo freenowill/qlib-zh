@@ -2,6 +2,8 @@
 
 基于 **Qlib**（微软 AI 量化框架）与 **RDAgent**（自动因子挖掘）的中国 A 股量化投资平台。集成 TuShare 数据管道、多市场 walk-forward LightGBM 训练、以及 Claude Code 驱动的自动化技能。
 
+> **下游应用**: 因子模型选出的 Top-K 股票，可接入 [stock-fish](https://github.com/freenowill/stock-fish) 进行舆情分析与股价推演，形成「因子选股 → 舆情验证 → 股价推演」的完整决策链。
+
 ## 快速开始
 
 ```bash
