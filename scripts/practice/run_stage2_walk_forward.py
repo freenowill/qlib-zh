@@ -77,7 +77,7 @@ MODEL_SPECS = [
 ]
 
 # Allow lightgbm_only mode via env var (skips XGBoost training for faster runs)
-if str(os.environ.get("STAGE2_LIGHTGBM_ONLY", "0")).strip() in ("1", "true", "yes"):
+if str(os.environ.get("STAGE2_LIGHTGBM_ONLY", "0")).strip().lower() in ("1", "true", "yes"):
     MODEL_SPECS = [s for s in MODEL_SPECS if s["name"] == "lightgbm"]
     if not MODEL_SPECS:
         raise RuntimeError("STAGE2_LIGHTGBM_ONLY is set but no lightgbm model found in MODEL_SPECS")

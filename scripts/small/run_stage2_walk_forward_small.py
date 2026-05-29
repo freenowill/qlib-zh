@@ -33,7 +33,7 @@ def main() -> None:
     module = _load_practice_module()
     root = Path(__file__).resolve().parents[2]
     template_root = root / "scripts" / "small" / "templates"
-    lightgbm_only = str(os.environ.get("STAGE2_LIGHTGBM_ONLY", "0")).strip() in ("1", "true", "yes")
+    lightgbm_only = str(os.environ.get("STAGE2_LIGHTGBM_ONLY", "0")).strip().lower() in ("1", "true", "yes")
 
     module.MODEL_SPECS = [
         {
