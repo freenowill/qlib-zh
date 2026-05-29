@@ -13,7 +13,24 @@ DATA/
 
 *.pkl
 *.hd5
+*.h5
 *.csv
+*.log
+*.tar.gz
+
+# factor mining output logs
+factors_results_*.txt
+
+# runtime caches & logs
+log/
+pickle_cache/
+.claude/scheduled_tasks.lock
+
+# data directories (large, not tracked)
+tushare/extra_data/
+rdagent_workspace/factor_implementation_source_data/
+rdagent_workspace/factor_implementation_source_data_debug/
+rdagent_workspace/factor_template_optimized/
 
 .env
 .vim
