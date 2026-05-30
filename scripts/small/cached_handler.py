@@ -249,9 +249,13 @@ def _load_data(
 
         if _has_mi and "datetime" in _mi_names:
             # New format: index is already (datetime, instrument)
-            if start_time and end_time:
-                df = df.loc[pd.IndexSlice[pd.Timestamp(start_time):pd.Timestamp(end_time)], :]
+            # sort_index() must come first — pickle may lose lexsort depth
             df = df.sort_index()
+            if start_time and end_time:
+                mask = df.index.get_level_values("datetime").between(
+                    pd.Timestamp(start_time), pd.Timestamp(end_time)
+                )
+                df = df.loc[mask]
         else:
             # Old format: datetime/instrument are regular columns
             # Normalize MultiIndex columns
