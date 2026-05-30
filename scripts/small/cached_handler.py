@@ -232,49 +232,51 @@ def _load_data(
     if not Path(path).exists():
         return None
     try:
-        # Try pickle first (primary format; also catch renamed .parquet files)
         _ext = Path(path).suffix.lower()
-        if _ext in (".pkl", ".pickle", ".parquet"):
-            if _PARQUET_OK and _ext == ".parquet":
-                import pyarrow.parquet as pq
-                with redirect_stdout(open(os.devnull, "w")):
-                    table = pq.read_table(path)
-                    df = table.to_pandas()
-            else:
-                df = pd.read_pickle(path)
+        if _ext in (".pkl", ".pickle"):
+            df = pd.read_pickle(path)
+        elif _PARQUET_OK and _ext == ".parquet":
+            import pyarrow.parquet as pq
+            with redirect_stdout(open(os.devnull, "w")):
+                table = pq.read_table(path)
+                df = table.to_pandas()
         else:
             df = pd.read_pickle(path)
 
-        # Normalize MultiIndex columns to plain strings.
-        # pyarrow's table.to_pandas() may or may not reconstruct the MultiIndex
-        # column structure from the parquet metadata depending on the version.
-        # Flattening here ensures consistent column name format for _find_col.
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [str(col) for col in df.columns]
+        # ── Detect whether MultiIndex is already set (new format) or in columns (old) ──
+        _has_mi = isinstance(df.index, pd.MultiIndex)
+        _mi_names = list(df.index.names) if _has_mi else []
 
-        if start_time and end_time and not df.empty:
-            date_col = _find_col(df, "datetime")
-            if date_col is None:
-                raise KeyError("datetime column not found in cached data")
-            dates = pd.to_datetime(df[date_col])
-            mask = (dates >= pd.Timestamp(start_time)) & (dates <= pd.Timestamp(end_time))
-            df = df[mask]
-
-        date_col = _find_col(df, "datetime")
-        inst_col = _find_col(df, "instrument")
-        if date_col and inst_col:
-            df = df.set_index([date_col, inst_col])
-            df.index = df.index.set_names(["datetime", "instrument"])
+        if _has_mi and "datetime" in _mi_names:
+            # New format: index is already (datetime, instrument)
+            if start_time and end_time:
+                df = df.loc[pd.IndexSlice[pd.Timestamp(start_time):pd.Timestamp(end_time)], :]
             df = df.sort_index()
+        else:
+            # Old format: datetime/instrument are regular columns
+            # Normalize MultiIndex columns
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [str(col) for col in df.columns]
+
+            if start_time and end_time and not df.empty:
+                date_col = _find_col(df, "datetime")
+                if date_col is None:
+                    raise KeyError("datetime column not found in cached data")
+                dates = pd.to_datetime(df[date_col])
+                mask = (dates >= pd.Timestamp(start_time)) & (dates <= pd.Timestamp(end_time))
+                df = df[mask]
+
+            date_col = _find_col(df, "datetime")
+            inst_col = _find_col(df, "instrument")
+            if date_col and inst_col:
+                df = df.set_index([date_col, inst_col])
+                df.index = df.index.set_names(["datetime", "instrument"])
+                df = df.sort_index()
 
         # Rebuild tuple columns from string reprs if needed
-        # e.g. "('feature', 'KMID')" → ("feature", "KMID")
         _rebuild_tuple_columns(df)
 
         # Convert tuple columns to proper MultiIndex for downstream compatibility.
-        # After _rebuild_tuple_columns, columns are a flat Index of tuples like
-        # ('feature', 'KMD').  qlib processors (e.g. CSZScoreNorm) call
-        # df.columns.get_loc('feature') which requires a proper MultiIndex.
         if len(df.columns) > 0 and isinstance(df.columns[0], tuple):
             df.columns = pd.MultiIndex.from_tuples(df.columns)
 
@@ -350,15 +352,20 @@ def _find_col(df: pd.DataFrame, key: str) -> str | None:
 
 
 def _dump_cached_data(df, path):
-    """Save a MultiIndex (datetime, instrument) DataFrame to disk (pickle)."""
+    """Save a MultiIndex (datetime, instrument) DataFrame to disk (pickle).
+
+    Saves directly with MultiIndex intact to avoid doubling memory via
+    reset_index().  Uses pickle for reliability with wide DataFrames
+    (200+ features) and tuple column names.
+    """
     import os
     path = str(path)
     n_rows = len(df)
     print(f"  [Cache] Saving {n_rows} rows to {os.path.basename(path)} ...", flush=True)
-    df_to_save = df.reset_index()
-    if isinstance(df_to_save.columns, pd.MultiIndex):
-        df_to_save.columns = [str(col) for col in df_to_save.columns]
-    df_to_save.to_pickle(path)
+    # Flatten MultiIndex columns to tuples so pickle handles them correctly
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [col if isinstance(col, tuple) else (col, "") for col in df.columns.values]
+    df.to_pickle(path)
     print(f"  [Cache] Pickle save done ({os.path.basename(path)})", flush=True)
 
 
