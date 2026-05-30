@@ -249,13 +249,15 @@ def _load_data(
 
         if _has_mi and "datetime" in _mi_names:
             # New format: index is already (datetime, instrument)
-            # sort_index() must come first — pickle may lose lexsort depth
+            # pickle may lose lexsort depth AND convert datetime to strings
             df = df.sort_index()
+            # Ensure datetime level is proper datetime type after pickle round-trip
+            dt_level = pd.to_datetime(df.index.get_level_values("datetime"))
             if start_time and end_time:
-                mask = df.index.get_level_values("datetime").between(
+                mask = dt_level.between(
                     pd.Timestamp(start_time), pd.Timestamp(end_time)
                 )
-                df = df.loc[mask]
+                df = df.loc[mask.values]
         else:
             # Old format: datetime/instrument are regular columns
             # Normalize MultiIndex columns
