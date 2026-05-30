@@ -407,11 +407,16 @@ def _precompute_handler_cache_parallel(
     end_time: str,
     provider_uri: str,
     workers: int,
+    chunk_size: int = 200,
 ) -> None:
-    """Split instruments across ``workers`` subprocesses, compute features, combine."""
+    """Split instruments across subprocesses, compute features, combine.
+
+    Instruments are split into chunks of ``chunk_size`` (default 200) to limit
+    per-worker memory usage.  ``workers`` controls the maximum number of
+    concurrent subprocesses — total chunks may exceed workers to bound memory.
+    """
     import copy
     from concurrent.futures import ProcessPoolExecutor
-    from pathlib import Path as _Path
 
     import pandas as pd
 
@@ -426,16 +431,16 @@ def _precompute_handler_cache_parallel(
     if not instruments:
         raise RuntimeError("No instruments found — cannot precompute cache")
 
-    chunk_size = max(1, (len(instruments) + workers - 1) // workers)
     chunks = [instruments[i:i + chunk_size] for i in range(0, len(instruments), chunk_size)]
     chunks = [c for c in chunks if c]
+    max_workers = min(workers, len(chunks))
 
     print(f"  [Cache] Parallel precompute: {len(instruments)} instruments → "
-          f"{len(chunks)} chunks × {workers} workers")
+          f"{len(chunks)} chunks (≤{chunk_size} inst/chunk) × {max_workers} concurrent workers")
 
     worker_cfg = copy.deepcopy(handler_cfg)
 
-    with ProcessPoolExecutor(max_workers=min(workers, len(chunks))) as ex:
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
         futures = [
             ex.submit(_precompute_worker, provider_uri, worker_cfg, chunk,
                        start_time, end_time, i)
